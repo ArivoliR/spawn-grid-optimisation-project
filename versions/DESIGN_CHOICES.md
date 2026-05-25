@@ -154,6 +154,27 @@ Even though this performs more direct loads, the access pattern is simple, has n
 wrap arithmetic in the hot path, and has no dependency chain between neighboring
 outputs. That gives the compiler more room to schedule instructions and
 potentially vectorize the loop.
+
+## 11 Branchless Transition Logic
+
+Version 11 replaces the scalar transition lookup table with compare/select
+logic:
+
+```text
+EMPTY    -> EGG   if 3 <= A <= 5
+EGG      -> JUVENILE
+JUVENILE -> ADULT
+ADULT    -> ADULT if 4 <= A <= 9
+```
+
+**Chosen over** `TRANSITION[cell][adult_count]`.
+
+Reason: profiling v10 showed horizontal-sum construction was only about 10% of
+runtime, while the vertical combine plus transition step was about 90%. The
+lookup table is branchless, but it is still a scalar indexed load per cell. The
+branchless compare/select form exposes the rule as arithmetic and comparisons,
+which is easier for the compiler to optimize and is a better shape for explicit
+SIMD later.
  
 ## Keep Binary Cell Storage For Now (Need to check this after we implement SIMD. Not sure which one might be better)
 
