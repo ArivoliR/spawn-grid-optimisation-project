@@ -16,6 +16,7 @@ performance measured for each step.
 | 07 | `versions/07_execution_par_chunks.cpp` | Experiments with `std::for_each(std::execution::par, ...)` over fixed row chunks. |
 | 08 | `versions/08_sliding_counts.cpp` | Keeps the persistent pool and replaces 24 explicit neighbor checks with rolling 5-wide adult sums for the five source rows. |
 | 09 | `versions/09_hsum_lut.cpp` | Precomputes per-generation horizontal 5-cell adult sums for all rows, then applies a constexpr transition lookup table. |
+| 10 | `versions/10_interior_edge_split.cpp` | Builds horizontal sums with direct interior indexing and handles only edge columns with toroidal wrap. |
 
 All versions keep the same CLI and binary I/O format:
 
@@ -62,6 +63,7 @@ public-style patterns:
 | 07 execution par chunks | 59.336 ms | 0.70x vs 06 | 4.45x |
 | 08 sliding counts | 21.347 ms | 1.94x vs 06 | 12.36x |
 | 09 hsum + LUT | 17.459 ms | 1.77x vs 08 | 15.11x |
+| 10 interior/edge split | 5.523 ms | 2.00x vs 09 | 47.77x |
 
 ### 1024x1024, 25 Generations, 3 Runs Per Pattern
 
@@ -75,6 +77,7 @@ public-style patterns:
 | 06 persistent pool | 38.485 ms | 0.98x | 6.86x |
 | 08 sliding counts | 16.844 ms | 2.28x vs 06 | 15.68x |
 | 09 hsum + LUT | 14.661 ms | 1.86x vs 08 | 18.01x |
+| 10 interior/edge split | 7.680 ms | 1.64x vs 09 | 34.38x |
 
 ## Interpretation
 
@@ -117,17 +120,24 @@ generation and is not memoized across generations, so this remains compliant
 with the O(generations * cells) constraint. Locally, version 09 improved over
 version 08 by about 1.77x on 512x512 and 1.86x on 1024x1024.
 
+Version 10 splits horizontal-sum construction into edge and interior columns.
+Only the first and last two columns need toroidal wrap logic. The hot interior
+range uses direct `x-2..x+2` indexing. This is still the same per-generation
+stencil computation, but avoids wrap/mask arithmetic in almost every horizontal
+sum. Locally, version 10 improved over version 09 by about 2.00x on 512x512 and
+1.64x on 1024x1024.
+
 ## Per-Pattern 512x512 Timings
 
 Median simulation time in milliseconds, 100 generations, 5 runs per pattern.
 
-| Pattern | 01 ref | 02 unrolled | 03 bitmask | 04 rows | 05 threads/gen | 06 pool | 07 execution | 08 sliding | 09 hsum+LUT |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| random_low | 279.104 | 233.809 | 199.600 | 192.983 | 39.787 | 33.630 | 66.678 | 31.896 | 15.911 |
-| random_high | 282.961 | 234.728 | 203.421 | 194.945 | 41.853 | 48.629 | 61.486 | 36.523 | 17.157 |
-| structured | 249.222 | 200.916 | 159.417 | 153.334 | 37.230 | 36.904 | 53.673 | 27.292 | 19.043 |
-| sparse_clusters | 251.835 | 214.075 | 172.463 | 159.468 | 33.965 | 40.958 | 58.075 | 28.349 | 18.318 |
-| boundary_stress | 257.995 | 216.570 | 177.827 | 165.731 | 56.371 | 49.249 | 57.556 | 31.563 | 17.036 |
+| Pattern | 01 ref | 02 unrolled | 03 bitmask | 04 rows | 05 threads/gen | 06 pool | 07 execution | 08 sliding | 09 hsum+LUT | 10 split |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| random_low | 279.104 | 233.809 | 199.600 | 192.983 | 39.787 | 33.630 | 66.678 | 31.896 | 15.911 | 5.761 |
+| random_high | 282.961 | 234.728 | 203.421 | 194.945 | 41.853 | 48.629 | 61.486 | 36.523 | 17.157 | 5.347 |
+| structured | 249.222 | 200.916 | 159.417 | 153.334 | 37.230 | 36.904 | 53.673 | 27.292 | 19.043 | 5.588 |
+| sparse_clusters | 251.835 | 214.075 | 172.463 | 159.468 | 33.965 | 40.958 | 58.075 | 28.349 | 18.318 | 5.221 |
+| boundary_stress | 257.995 | 216.570 | 177.827 | 165.731 | 56.371 | 49.249 | 57.556 | 31.563 | 17.036 | 5.716 |
 
 ## Reproduction Commands
 

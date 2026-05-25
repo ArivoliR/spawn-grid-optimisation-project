@@ -116,6 +116,44 @@ Materializing those sums once per generation reduces duplicate work. The
 transition lookup table is a fixed encoding of the official rules, independent
 of input data. The scratch buffer is rebuilt every generation, so this is a
 constant-factor optimization, not memoization across generations.
+
+## 10 Interior/Edge Split
+
+Version 10 changes horizontal-sum construction so only the first and last two
+columns use toroidal wrapping. The interior columns use direct indexing:
+
+```text
+adult[x-2] + adult[x-1] + adult[x] + adult[x+1] + adult[x+2]
+```
+
+**Chosen over** using `& (N - 1)` wrap arithmetic for every column.
+
+Reason: almost every cell is an interior cell. On large grids, only four columns
+per row need wrap handling. Splitting edges from the interior keeps the same
+stencil and the same O(generations * cells) behavior, but removes unnecessary
+wrap arithmetic from the hot path.
+
+An important compiler detail: version 09's rolling horizontal sum has a
+loop-carried dependency:
+
+```cpp
+h = h + adult[add_x] - adult[remove_x];
+out[x] = h;
+```
+
+Each iteration needs the previous iteration's `h`, which limits instruction
+level parallelism and makes autovectorization harder. Version 10's interior loop
+computes each output independently:
+
+```cpp
+out[x] = adult[x - 2] + adult[x - 1] + adult[x]
+       + adult[x + 1] + adult[x + 2];
+```
+
+Even though this performs more direct loads, the access pattern is simple, has no
+wrap arithmetic in the hot path, and has no dependency chain between neighboring
+outputs. That gives the compiler more room to schedule instructions and
+potentially vectorize the loop.
  
 ## Keep Binary Cell Storage For Now (Need to check this after we implement SIMD. Not sure which one might be better)
 
