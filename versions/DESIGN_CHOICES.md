@@ -95,6 +95,27 @@ and combines them to get the 5x5 adult count, subtracting the center cell.
 Reason: adjacent cells share most of their 5x5 neighborhood. Sliding counts
 reuse overlapping horizontal work and reduce scalar neighbor-count cost while
 preserving the required O(generations * cells) simulation structure.  
+
+## 09 Precomputed Horizontal Sums And Transition LUT
+
+Version 09 computes a per-generation scratch buffer:
+
+```text
+hsum[y][x] = adult[y][x-2] + adult[y][x-1] + adult[y][x]
+           + adult[y][x+1] + adult[y][x+2]
+```
+
+Then each cell combines five `hsum` rows and subtracts the center adult value.
+It also uses a constexpr transition table for `state x adult_count`.
+
+**Chosen over** recomputing rolling horizontal sums separately for every output
+row and using a `switch` for every transition.
+
+Reason: neighboring output rows reuse the same source-row horizontal sums.
+Materializing those sums once per generation reduces duplicate work. The
+transition lookup table is a fixed encoding of the official rules, independent
+of input data. The scratch buffer is rebuilt every generation, so this is a
+constant-factor optimization, not memoization across generations.
  
 ## Keep Binary Cell Storage For Now (Need to check this after we implement SIMD. Not sure which one might be better)
 
@@ -106,4 +127,3 @@ Reason: byte storage matches the input/output format, keeps transitions simple,
 and avoids conversion complexity while the algorithm is still evolving. A future
 SIMD version may introduce separate adult masks or packed representations if
 benchmarks show the conversion cost pays off.
-

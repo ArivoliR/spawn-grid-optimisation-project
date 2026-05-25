@@ -15,6 +15,7 @@ performance measured for each step.
 | 06 | `versions/06_persistent_pool.cpp` | Uses the current persistent thread pool with barriers between generations. |
 | 07 | `versions/07_execution_par_chunks.cpp` | Experiments with `std::for_each(std::execution::par, ...)` over fixed row chunks. |
 | 08 | `versions/08_sliding_counts.cpp` | Keeps the persistent pool and replaces 24 explicit neighbor checks with rolling 5-wide adult sums for the five source rows. |
+| 09 | `versions/09_hsum_lut.cpp` | Precomputes per-generation horizontal 5-cell adult sums for all rows, then applies a constexpr transition lookup table. |
 
 All versions keep the same CLI and binary I/O format:
 
@@ -60,6 +61,7 @@ public-style patterns:
 | 06 persistent pool | 41.408 ms | 0.99x | 6.37x |
 | 07 execution par chunks | 59.336 ms | 0.70x vs 06 | 4.45x |
 | 08 sliding counts | 21.347 ms | 1.94x vs 06 | 12.36x |
+| 09 hsum + LUT | 17.459 ms | 1.77x vs 08 | 15.11x |
 
 ### 1024x1024, 25 Generations, 3 Runs Per Pattern
 
@@ -72,6 +74,7 @@ public-style patterns:
 | 05 thread per generation | 37.880 ms | 4.47x | 6.97x |
 | 06 persistent pool | 38.485 ms | 0.98x | 6.86x |
 | 08 sliding counts | 16.844 ms | 2.28x vs 06 | 15.68x |
+| 09 hsum + LUT | 14.661 ms | 1.86x vs 08 | 18.01x |
 
 ## Interpretation
 
@@ -106,17 +109,25 @@ horizontal neighborhood work between adjacent cells. Locally, this produced a
 clear improvement over version 06: about 1.5x on the 512x512 benchmark and
 1.8x on the 1024x1024 spot check.
 
+Version 09 moves the horizontal sums into a full per-generation scratch buffer.
+This avoids recomputing the same row-local 5-cell sums for neighboring output
+rows. It also replaces the transition `switch` with a fixed constexpr table of
+the official rules. The scratch buffer is recomputed from the current grid every
+generation and is not memoized across generations, so this remains compliant
+with the O(generations * cells) constraint. Locally, version 09 improved over
+version 08 by about 1.77x on 512x512 and 1.86x on 1024x1024.
+
 ## Per-Pattern 512x512 Timings
 
 Median simulation time in milliseconds, 100 generations, 5 runs per pattern.
 
-| Pattern | 01 ref | 02 unrolled | 03 bitmask | 04 rows | 05 threads/gen | 06 pool | 07 execution | 08 sliding |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| random_low | 279.104 | 233.809 | 199.600 | 192.983 | 39.787 | 33.630 | 66.678 | 21.263 |
-| random_high | 282.961 | 234.728 | 203.421 | 194.945 | 41.853 | 48.629 | 61.486 | 22.822 |
-| structured | 249.222 | 200.916 | 159.417 | 153.334 | 37.230 | 36.904 | 53.673 | 16.404 |
-| sparse_clusters | 251.835 | 214.075 | 172.463 | 159.468 | 33.965 | 40.958 | 58.075 | 25.038 |
-| boundary_stress | 257.995 | 216.570 | 177.827 | 165.731 | 56.371 | 49.249 | 57.556 | 22.239 |
+| Pattern | 01 ref | 02 unrolled | 03 bitmask | 04 rows | 05 threads/gen | 06 pool | 07 execution | 08 sliding | 09 hsum+LUT |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| random_low | 279.104 | 233.809 | 199.600 | 192.983 | 39.787 | 33.630 | 66.678 | 31.896 | 15.911 |
+| random_high | 282.961 | 234.728 | 203.421 | 194.945 | 41.853 | 48.629 | 61.486 | 36.523 | 17.157 |
+| structured | 249.222 | 200.916 | 159.417 | 153.334 | 37.230 | 36.904 | 53.673 | 27.292 | 19.043 |
+| sparse_clusters | 251.835 | 214.075 | 172.463 | 159.468 | 33.965 | 40.958 | 58.075 | 28.349 | 18.318 |
+| boundary_stress | 257.995 | 216.570 | 177.827 | 165.731 | 56.371 | 49.249 | 57.556 | 31.563 | 17.036 |
 
 ## Reproduction Commands
 
