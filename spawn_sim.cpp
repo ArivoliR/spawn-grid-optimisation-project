@@ -17,11 +17,14 @@
 //       (intrinsic veor3q_u8 in <arm_neon.h>; ARMv8.2-SHA3 extension,
 //       supported natively on Neoverse-V2). Build flag includes +sha3.
 //
-//   (3) THREADING via std::jthread + std::barrier
+//   (3) THREADING via std::thread + a hand-rolled atomic-counter barrier
 //       The grid is partitioned into N_THREADS horizontal strips. Each
-//       strip is owned by one worker thread for the entire run. A
-//       barrier between generations performs the buffer swap. No work
-//       stealing; uniform stencil so static partitioning suffices.
+//       strip is owned by one worker thread for the entire run. Between
+//       generations the threads synchronise on a per-generation atomic
+//       counter: the last thread to arrive performs the buffer swap and
+//       advances a generation number; the others spin-wait on the
+//       generation number. No std::barrier, no std::latch, no
+//       std::jthread -- just std::thread and std::atomic.
 //
 // All other algorithmic concerns (asymptotic complexity, the rule, the
 // file format, the timing methodology) follow the reference exactly.
@@ -32,14 +35,12 @@
 #include <arm_neon.h>
 
 #include <atomic>
-#include <barrier>
 #include <chrono>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <latch>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -447,17 +448,23 @@ int main(int argc, char* argv[])
     uint8_t* next_high = high_b.get();
 
     // -------------------------------------------------------------------------
-    // Set up worker threads, one strip each. Barrier swaps the buffers
-    // exactly once per generation in its completion function.
+    // Set up worker threads, one strip each. A per-generation atomic-counter
+    // barrier replaces std::barrier:
+    //   - Each thread, on reaching the end of a generation, atomically
+    //     increments `arrival_count`.
+    //   - The thread whose fetch_add brings the count to n_threads is the
+    //     "last arrival": it performs the buffer swap, resets the counter,
+    //     and advances `gen_done` (release).
+    //   - All other threads spin-wait on `gen_done > gen` (acquire).
+    // The release/acquire pair on gen_done provides the memory ordering
+    // that makes the swapped pointers visible to all threads.
     // -------------------------------------------------------------------------
     const int n_threads = choose_thread_count();
-    std::barrier gen_barrier(n_threads, [&]() noexcept {
-        std::swap(cur_low,  next_low);
-        std::swap(cur_high, next_high);
-    });
-    std::latch start_latch(1);
+    std::atomic<int> arrival_count{0};
+    std::atomic<int> gen_done{0};
+    std::atomic<bool> started{false};
 
-    std::vector<std::jthread> workers;
+    std::vector<std::thread> workers;
     workers.reserve(n_threads);
     for (int t = 0; t < n_threads; ++t) {
         size_t y_start = (size_t(t)     * N) / size_t(n_threads);
@@ -465,11 +472,25 @@ int main(int argc, char* argv[])
         workers.emplace_back([&, t, y_start, y_end]() {
             pin_to_cpu(t);
             ensure_ring(R_BYTES);
-            start_latch.wait();
+            while (!started.load(std::memory_order_acquire))
+                std::this_thread::yield();
             for (int gen = 0; gen < generations; ++gen) {
                 step_strip(cur_low, cur_high, next_low, next_high,
                            N, R_BYTES, R_REGS, y_start, y_end);
-                gen_barrier.arrive_and_wait();
+
+                // Atomic-counter barrier with completion.
+                int arrived = arrival_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+                if (arrived == n_threads) {
+                    // Last to arrive: swap buffers, reset, release others.
+                    std::swap(cur_low,  next_low);
+                    std::swap(cur_high, next_high);
+                    arrival_count.store(0, std::memory_order_relaxed);
+                    gen_done.store(gen + 1, std::memory_order_release);
+                } else {
+                    // Others: spin until last arrival publishes new gen_done.
+                    while (gen_done.load(std::memory_order_acquire) <= gen)
+                        std::this_thread::yield();
+                }
             }
         });
     }
@@ -478,7 +499,7 @@ int main(int argc, char* argv[])
     // Timed region
     // -------------------------------------------------------------------------
     auto t0 = std::chrono::steady_clock::now();
-    start_latch.count_down();
+    started.store(true, std::memory_order_release);
     for (auto& w : workers) w.join();
     auto t1 = std::chrono::steady_clock::now();
 
