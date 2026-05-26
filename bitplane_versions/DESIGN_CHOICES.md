@@ -19,6 +19,7 @@ Bitplane versions are named `vbNN` in the notes:
 - `vb10` -> `10_bitplane_neon_predicate_huge.cpp`
 - `vb11` -> `11_bitplane_temporal_stripe.cpp`
 - `vb12` -> `12_bitplane_temporal_ring.cpp`
+- `vb13` -> `13_bitplane_eor3_aligned.cpp`
 
 ## vb01: Bitplane Scalar Kernel
 
@@ -306,6 +307,27 @@ offset `2 * k_this`, not always `2 * TIME_K`. This is equivalent for the
 10000-generation benchmark because `10000 % 4 == 0`, but it is required for
 correct output when the requested generation count is not divisible by 4.
 
+TODO: Vet this para tmrw
+
+## vb13: EOR3 And Aligned Storage
+
+`vb13` returns to the simpler `vb10` single-generation block-H kernel and keeps
+only the two measured low-risk wins from the direct feature experiments:
+
+- SHA3 `EOR3` in the vertical add/sub chains
+- 64-byte aligned vector storage for main bitplanes and per-thread scratch
+
+Chosen over: keeping explicit worker CPU pinning.
+
+Reason: target measurements showed EOR3 was a small win and aligned vector
+storage was a larger win. Explicit pinning did not help when the process was
+already launched with `taskset -c 0-7`, and made the code less minimal. The
+cleaned `vb13` therefore removes the pinning code while preserving the useful
+changes.
+
+This remains the `uint64x2_t` block-H design from `vb10`; it does not adopt the
+larger byte-lane H-row kernel rewrite.
+
 ## SIMD Direction: Prefer Widening Before Tree Reduction
 
 Local x86 AVX2 experiments compared two SIMD shapes:
@@ -328,6 +350,7 @@ but it should not block the NEON port.
 
 ## Current Next Step
 
-Benchmark `vb12` against `vb10`. If it passes correctness and stays near the
-observed `156 s`, it becomes the current best; otherwise the fallback remains
-`vb10`.
+Use `vb13` as the minimal cleaned candidate for the current line. The next major
+performance direction is a byte-lane NEON horizontal row-sum kernel with an
+adder tree, but that is a larger kernel rewrite rather than another small patch
+to the `uint64x2_t` `vb10`/`vb13` implementation.

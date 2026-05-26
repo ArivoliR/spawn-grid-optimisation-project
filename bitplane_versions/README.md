@@ -39,6 +39,11 @@ in `versions/`.
   slab-local 5-row H ring instead of the block-H buffer. This is based on the
   faster temporal contender, with the final writeback offset fixed for
   generation counts that are not divisible by 4.
+- `13_bitplane_eor3_aligned.cpp`: minimal `vb10` improvement. Keeps SHA3
+  `EOR3` in the vertical add/sub chains and 64-byte aligned vector storage;
+  leaves out explicit CPU pinning because it showed no benefit under `taskset`.
+- `experiments_v13_v15/`: archived one-by-one experiments for EOR3, pinning,
+  and aligned storage.
 
 All versions still run every generation over the full grid. The speedup
 comes from representation, threading, cache behavior, and removing hot-path
