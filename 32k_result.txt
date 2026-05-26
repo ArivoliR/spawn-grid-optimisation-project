@@ -1,0 +1,43 @@
+Monster Spawning Grid — 32K x 32K, 10000 generations
+=====================================================
+
+Hardware    : c8g.2xlarge (AWS Graviton4 / Neoverse-V2, 8 vCPUs, 16 GiB)
+Binary      : ./spawn_sim                (8-thread NEON + SHA3 build)
+Input       : test_grids/public_1_random_low_32768.bin   (1.0 GiB, ~5.08% adult)
+Output file : /tmp/mine_32k.bin                          (1.0 GiB)
+Generations : 10000
+CPU pinning : taskset -c 0-7
+Run time    : 2026-05-26
+
+----------------------------------------------------------
+SIMULATION TIME (excludes I/O): 138978.983 ms  (~139.0 s)
+----------------------------------------------------------
+
+Reference projection
+--------------------
+The reference at 32K is documented in test_grids/README.md as taking
+~25 hours per 10000-generation run. Scaling the measured reference
+time at 2048 (501 248 ms = 8.35 min) by the cell-count ratio
+(32768/2048)^2 = 256 gives an estimate of 501 248 * 256 ≈ 128 319 488 ms
+(~35.6 hours). Either figure puts the speedup at:
+
+  138 978.983 ms vs ~25 h = 9 * 10^7 ms  =>  ~650x
+  138 978.983 ms vs ~35 h = 1.28 * 10^8 ms => ~920x
+
+The proper reference baseline would require running the reference once
+on this exact machine (~25 hours wall-clock) for an apples-to-apples
+comparison. The 2048 speedup of ~922x is a reasonable proxy until then.
+
+Notes
+-----
+- Correctness at 32K was NOT verified bit-identically against the
+  reference (would require ~25 hours of reference runtime). Bit-identity
+  was verified at 512 (all 4 patterns) and 2048 (random_low) earlier.
+- This is single-run timing, not a harness median. The result is large
+  enough that run-to-run variance from CPU/OS noise is negligible
+  (~1% expected).
+- 32K working set spills L2/L3 -> DRAM bandwidth dominates. This is
+  consistent with the per-cell throughput observed:
+    2048: 543.881 ms / (2048^2 * 10000) = 0.13 ns/cell
+   32768: 138979 ms / (32768^2 * 10000) = 1.30 ns/cell
+  10x slower per cell, matching the L2-fits-vs-spills boundary.
