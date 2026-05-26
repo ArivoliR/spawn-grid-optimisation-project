@@ -18,6 +18,8 @@ performance measured for each step.
 | 09 | `versions/09_hsum_lut.cpp` | Precomputes per-generation horizontal 5-cell adult sums for all rows, then applies a constexpr transition lookup table. |
 | 10 | `versions/10_interior_edge_split.cpp` | Builds horizontal sums with direct interior indexing and handles only edge columns with toroidal wrap. |
 | 11 | `versions/11_branchless_transition.cpp` | Replaces the scalar transition lookup table with branchless compare/select logic. |
+| 12 | `versions/12_bitplane_scalar.cpp` | Rewrites the simulator around two state bitplanes, processing 64 cells per `uint64_t` word. |
+| 13 | `versions/13_bitplane_ring.cpp` | Adds a 5-slot horizontal row-sum ring buffer to the bitplane kernel. |
 
 All versions keep the same CLI and binary I/O format:
 
@@ -66,6 +68,8 @@ public-style patterns:
 | 09 hsum + LUT | 17.459 ms | 1.77x vs 08 | 15.11x |
 | 10 interior/edge split | 5.523 ms | 2.00x vs 09 | 47.77x |
 | 11 branchless transition | 4.936 ms | 1.79x vs 10 | 53.45x |
+| 12 bitplane scalar | 3.871 ms | 1.33x vs 11 | 68.16x |
+| 13 bitplane ring | 2.029 ms | 1.91x vs 12 | 130.04x |
 
 ### 1024x1024, 25 Generations, 3 Runs Per Pattern
 
@@ -81,6 +85,8 @@ public-style patterns:
 | 09 hsum + LUT | 14.661 ms | 1.86x vs 08 | 18.01x |
 | 10 interior/edge split | 7.680 ms | 1.64x vs 09 | 34.38x |
 | 11 branchless transition | 4.081 ms | 1.91x vs 10 | 64.70x |
+| 12 bitplane scalar | 2.671 ms | 1.24x vs 11 | 98.86x |
+| 13 bitplane ring | 1.264 ms | 2.11x vs 12 | 208.90x |
 
 ## Interpretation
 
@@ -137,6 +143,18 @@ The lookup table was branchless but scalar and awkward for vectorization. The
 branchless rule logic exposes comparisons and byte arithmetic directly to the
 compiler, making the step phase more SIMD-friendly. Locally, version 11 improved
 over version 10 by about 1.79x on 512x512 and 1.91x on 1024x1024.
+
+Version 12 pivots from byte-per-cell storage to two bitplanes. Each `uint64_t`
+word represents 64 cells, with `ADULT` expressed as `s0 & s1`. This reduces grid
+state memory by 4x and lets the scalar kernel update 64 cells at a time with
+bitwise arithmetic. The first scalar bitplane version was already faster than
+the byte-grid v11: about 1.33x on 512x512 and 1.24x on 1024x1024.
+
+Version 13 adds a 5-slot ring buffer of horizontal row sums to the bitplane
+kernel. Instead of recomputing all horizontal shifted adult masks for every
+output row, each source row's 5-wide horizontal sum is computed once and reused
+for five neighboring output rows. This improved over version 12 by about 1.91x
+on 512x512 and 2.11x on 1024x1024.
 
 ## Per-Pattern 512x512 Timings
 

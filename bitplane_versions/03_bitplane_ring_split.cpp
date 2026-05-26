@@ -1,0 +1,440 @@
+// Bitplane version 03: row-sum ring buffer plus interior/edge word split.
+//
+// Representation:
+//   state bit 0 plane: s0
+//   state bit 1 plane: s1
+//   ADULT == 3 == s1 & s0
+//
+// Each uint64_t word stores 64 horizontal cells. Compared to v12, this version
+// computes the horizontal 5-cell ADULT sum for each source row once, stores that
+// as three bitplanes in a 5-slot ring, then combines the five ring slots
+// vertically. This avoids rebuilding the same horizontal sums for neighboring
+// output rows.
+//
+// Compared to bitplane version 02, horizontal row-sum construction no longer
+// performs modulo wrap in the hot path. Only the first/last words need toroidal
+// word-boundary handling; interior words use direct w-1/w+1 loads.
+
+#include <algorithm>
+#include <barrier>
+#include <chrono>
+#include <cinttypes>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
+#include <vector>
+
+static constexpr uint8_t EMPTY    = 0;
+static constexpr uint8_t EGG      = 1;
+static constexpr uint8_t JUVENILE = 2;
+static constexpr uint8_t ADULT    = 3;
+
+struct BitGrid {
+    int n = 0;
+    int row_words = 0;
+    std::vector<uint64_t> s0;
+    std::vector<uint64_t> s1;
+
+    void resize(int side)
+    {
+        n = side;
+        row_words = n / 64;
+        s0.assign((size_t)n * row_words, 0);
+        s1.assign((size_t)n * row_words, 0);
+    }
+
+    const uint64_t* row0(int y) const { return s0.data() + (size_t)y * row_words; }
+    const uint64_t* row1(int y) const { return s1.data() + (size_t)y * row_words; }
+    uint64_t* row0(int y) { return s0.data() + (size_t)y * row_words; }
+    uint64_t* row1(int y) { return s1.data() + (size_t)y * row_words; }
+};
+
+static void bytes_to_bitgrid(const std::vector<uint8_t>& cells, BitGrid& out)
+{
+    const int N = out.n;
+    const int rw = out.row_words;
+    for (int y = 0; y < N; ++y) {
+        uint64_t* s0 = out.row0(y);
+        uint64_t* s1 = out.row1(y);
+        for (int w = 0; w < rw; ++w) {
+            uint64_t lo = 0;
+            uint64_t hi = 0;
+            const size_t base = (size_t)y * N + (size_t)w * 64;
+            for (int b = 0; b < 64; ++b) {
+                const uint8_t cell = cells[base + b];
+                lo |= (uint64_t)(cell & 1u) << b;
+                hi |= (uint64_t)((cell >> 1) & 1u) << b;
+            }
+            s0[w] = lo;
+            s1[w] = hi;
+        }
+    }
+}
+
+static void bitgrid_to_bytes(const BitGrid& in, std::vector<uint8_t>& cells)
+{
+    const int N = in.n;
+    const int rw = in.row_words;
+    cells.assign((size_t)N * N, 0);
+    for (int y = 0; y < N; ++y) {
+        const uint64_t* s0 = in.row0(y);
+        const uint64_t* s1 = in.row1(y);
+        for (int w = 0; w < rw; ++w) {
+            uint64_t lo = s0[w];
+            uint64_t hi = s1[w];
+            const size_t base = (size_t)y * N + (size_t)w * 64;
+            for (int b = 0; b < 64; ++b) {
+                cells[base + b] = (uint8_t)(((lo >> b) & 1u) | (((hi >> b) & 1u) << 1));
+            }
+        }
+    }
+}
+
+static inline uint64_t shifted_adult_word(const uint64_t* adult, int rw, int w, int dx)
+{
+    const uint64_t prev = adult[(w - 1 + rw) % rw];
+    const uint64_t curr = adult[w];
+    const uint64_t next = adult[(w + 1) % rw];
+
+    switch (dx) {
+        case -2: return (curr << 2) | (prev >> 62);
+        case -1: return (curr << 1) | (prev >> 63);
+        case  0: return curr;
+        case  1: return (curr >> 1) | (next << 63);
+        case  2: return (curr >> 2) | (next << 62);
+        default: return 0;
+    }
+}
+
+static inline uint64_t shifted_adult_word_with_neighbors(uint64_t prev, uint64_t curr,
+                                                         uint64_t next, int dx)
+{
+    switch (dx) {
+        case -2: return (curr << 2) | (prev >> 62);
+        case -1: return (curr << 1) | (prev >> 63);
+        case  0: return curr;
+        case  1: return (curr >> 1) | (next << 63);
+        case  2: return (curr >> 2) | (next << 62);
+        default: return 0;
+    }
+}
+
+static inline void add_mask_to_count(uint64_t mask,
+                                     uint64_t& c0, uint64_t& c1, uint64_t& c2,
+                                     uint64_t& c3, uint64_t& c4)
+{
+    uint64_t carry = c0 & mask;
+    c0 ^= mask;
+    mask = carry;
+
+    carry = c1 & mask;
+    c1 ^= mask;
+    mask = carry;
+
+    carry = c2 & mask;
+    c2 ^= mask;
+    mask = carry;
+
+    carry = c3 & mask;
+    c3 ^= mask;
+    mask = carry;
+
+    c4 ^= mask;
+}
+
+static inline void row_sum_5_word(const uint64_t* adult, int rw, int w,
+                                  uint64_t& r0, uint64_t& r1, uint64_t& r2)
+{
+    uint64_t c0 = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0;
+    add_mask_to_count(shifted_adult_word(adult, rw, w, -2), c0, c1, c2, c3, c4);
+    add_mask_to_count(shifted_adult_word(adult, rw, w, -1), c0, c1, c2, c3, c4);
+    add_mask_to_count(shifted_adult_word(adult, rw, w,  0), c0, c1, c2, c3, c4);
+    add_mask_to_count(shifted_adult_word(adult, rw, w,  1), c0, c1, c2, c3, c4);
+    add_mask_to_count(shifted_adult_word(adult, rw, w,  2), c0, c1, c2, c3, c4);
+    r0 = c0;
+    r1 = c1;
+    r2 = c2;
+}
+
+static inline void row_sum_5_word_neighbors(uint64_t prev, uint64_t curr, uint64_t next,
+                                            uint64_t& r0, uint64_t& r1, uint64_t& r2)
+{
+    uint64_t c0 = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0;
+    add_mask_to_count(shifted_adult_word_with_neighbors(prev, curr, next, -2), c0, c1, c2, c3, c4);
+    add_mask_to_count(shifted_adult_word_with_neighbors(prev, curr, next, -1), c0, c1, c2, c3, c4);
+    add_mask_to_count(shifted_adult_word_with_neighbors(prev, curr, next,  0), c0, c1, c2, c3, c4);
+    add_mask_to_count(shifted_adult_word_with_neighbors(prev, curr, next,  1), c0, c1, c2, c3, c4);
+    add_mask_to_count(shifted_adult_word_with_neighbors(prev, curr, next,  2), c0, c1, c2, c3, c4);
+    r0 = c0;
+    r1 = c1;
+    r2 = c2;
+}
+
+static inline void add_rowsum_to_count(uint64_t r0, uint64_t r1, uint64_t r2,
+                                       uint64_t& c0, uint64_t& c1, uint64_t& c2,
+                                       uint64_t& c3, uint64_t& c4)
+{
+    uint64_t carry;
+
+    const uint64_t ns0 = c0 ^ r0;
+    carry = c0 & r0;
+    c0 = ns0;
+
+    const uint64_t c1xr1 = c1 ^ r1;
+    const uint64_t ns1 = c1xr1 ^ carry;
+    carry = (c1 & r1) | (carry & c1xr1);
+    c1 = ns1;
+
+    const uint64_t c2xr2 = c2 ^ r2;
+    const uint64_t ns2 = c2xr2 ^ carry;
+    carry = (c2 & r2) | (carry & c2xr2);
+    c2 = ns2;
+
+    const uint64_t ns3 = c3 ^ carry;
+    carry = c3 & carry;
+    c3 = ns3;
+
+    c4 ^= carry;
+}
+
+static inline void subtract_mask_from_count(uint64_t mask,
+                                            uint64_t& c0, uint64_t& c1, uint64_t& c2,
+                                            uint64_t& c3, uint64_t& c4)
+{
+    uint64_t borrow = mask;
+    uint64_t diff;
+
+    diff = c0 ^ borrow;
+    borrow = ~c0 & borrow;
+    c0 = diff;
+
+    diff = c1 ^ borrow;
+    borrow = ~c1 & borrow;
+    c1 = diff;
+
+    diff = c2 ^ borrow;
+    borrow = ~c2 & borrow;
+    c2 = diff;
+
+    diff = c3 ^ borrow;
+    borrow = ~c3 & borrow;
+    c3 = diff;
+
+    c4 ^= borrow;
+}
+
+static void step_rows_bitplane(const BitGrid& src, BitGrid& dst, int y0, int y1)
+{
+    const int N = src.n;
+    const int rw = src.row_words;
+    const int ymask = N - 1;
+
+    std::vector<uint64_t> adult_tmp(rw);
+    std::vector<uint64_t> rowsum_store(5 * 3 * (size_t)rw);
+    uint64_t* rs0[5];
+    uint64_t* rs1[5];
+    uint64_t* rs2[5];
+    for (int i = 0; i < 5; ++i) {
+        rs0[i] = rowsum_store.data() + (size_t)(3 * i + 0) * rw;
+        rs1[i] = rowsum_store.data() + (size_t)(3 * i + 1) * rw;
+        rs2[i] = rowsum_store.data() + (size_t)(3 * i + 2) * rw;
+    }
+
+    auto fill_slot = [&](int src_y, int slot) {
+        const int yy = src_y & ymask;
+        const uint64_t* s0 = src.row0(yy);
+        const uint64_t* s1 = src.row1(yy);
+        for (int w = 0; w < rw; ++w) {
+            adult_tmp[w] = s0[w] & s1[w];
+        }
+        if (rw == 1) {
+            row_sum_5_word(adult_tmp.data(), rw, 0, rs0[slot][0], rs1[slot][0], rs2[slot][0]);
+            return;
+        }
+
+        row_sum_5_word_neighbors(adult_tmp[rw - 1], adult_tmp[0], adult_tmp[1],
+                                 rs0[slot][0], rs1[slot][0], rs2[slot][0]);
+
+        for (int w = 1; w < rw - 1; ++w) {
+            row_sum_5_word_neighbors(adult_tmp[w - 1], adult_tmp[w], adult_tmp[w + 1],
+                                     rs0[slot][w], rs1[slot][w], rs2[slot][w]);
+        }
+
+        row_sum_5_word_neighbors(adult_tmp[rw - 2], adult_tmp[rw - 1], adult_tmp[0],
+                                 rs0[slot][rw - 1], rs1[slot][rw - 1], rs2[slot][rw - 1]);
+    };
+
+    for (int delta = -2; delta <= 2; ++delta) {
+        fill_slot(y0 + delta, delta + 2);
+    }
+    int tail = 0;
+
+    for (int y = y0; y < y1; ++y) {
+
+        const uint64_t* center0 = src.row0(y);
+        const uint64_t* center1 = src.row1(y);
+        uint64_t* out0 = dst.row0(y);
+        uint64_t* out1 = dst.row1(y);
+
+        for (int w = 0; w < rw; ++w) {
+            uint64_t c0 = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0;
+
+            for (int slot = 0; slot < 5; ++slot) {
+                add_rowsum_to_count(rs0[slot][w], rs1[slot][w], rs2[slot][w], c0, c1, c2, c3, c4);
+            }
+
+            const uint64_t s0 = center0[w];
+            const uint64_t s1 = center1[w];
+            const uint64_t adult = s0 & s1;
+            subtract_mask_from_count(adult, c0, c1, c2, c3, c4);
+
+            const uint64_t empty = ~(s0 | s1);
+            const uint64_t egg = s0 & ~s1;
+            const uint64_t juvenile = s1 & ~s0;
+
+            const uint64_t nc4 = ~c4, nc3 = ~c3, nc2 = ~c2, nc1 = ~c1, nc0 = ~c0;
+            const uint64_t eq3 = nc4 & nc3 & nc2 & c1  & c0;
+            const uint64_t eq4 = nc4 & nc3 & c2  & nc1 & nc0;
+            const uint64_t eq5 = nc4 & nc3 & c2  & nc1 & c0;
+            const uint64_t eq6 = nc4 & nc3 & c2  & c1  & nc0;
+            const uint64_t eq7 = nc4 & nc3 & c2  & c1  & c0;
+            const uint64_t eq8 = nc4 & c3  & nc2 & nc1 & nc0;
+            const uint64_t eq9 = nc4 & c3  & nc2 & nc1 & c0;
+
+            const uint64_t birth = empty & (eq3 | eq4 | eq5);
+            const uint64_t survive = adult & (eq4 | eq5 | eq6 | eq7 | eq8 | eq9);
+
+            out1[w] = egg | juvenile | survive;
+            out0[w] = birth | juvenile | survive;
+        }
+
+        fill_slot(y + 3, tail);
+        tail = (tail + 1) % 5;
+    }
+}
+
+int main(int argc, char* argv[])
+{
+    if (argc < 3 || argc > 4) {
+        std::fprintf(stderr, "Usage: %s <input.bin> <output.bin> [generations]\n", argv[0]);
+        return 1;
+    }
+
+    int generations = 10000;
+    if (argc == 4) {
+        char* end;
+        long g = std::strtol(argv[3], &end, 10);
+        if (*end != '\0' || g <= 0) {
+            std::fprintf(stderr, "Error: generations must be a positive integer\n");
+            return 1;
+        }
+        generations = (int)g;
+    }
+
+    FILE* fin = std::fopen(argv[1], "rb");
+    if (!fin) {
+        std::fprintf(stderr, "Error: cannot open input file '%s'\n", argv[1]);
+        return 2;
+    }
+
+    uint64_t width, height;
+    if (std::fread(&width, sizeof(uint64_t), 1, fin) != 1 ||
+        std::fread(&height, sizeof(uint64_t), 1, fin) != 1) {
+        std::fprintf(stderr, "Error: input file too short (cannot read header)\n");
+        std::fclose(fin);
+        return 3;
+    }
+    if (width == 0 || width != height || (width % 64) != 0) {
+        std::fprintf(stderr,
+            "Error: grid must be square, non-empty, and divisible by 64, got %" PRIu64 " x %" PRIu64 "\n",
+            width, height);
+        std::fclose(fin);
+        return 3;
+    }
+
+    const int N = (int)width;
+    const size_t Ncells = (size_t)N * N;
+
+    std::vector<uint8_t> cells(Ncells);
+    if (std::fread(cells.data(), 1, Ncells, fin) != Ncells) {
+        std::fprintf(stderr, "Error: input file too short (cell data truncated)\n");
+        std::fclose(fin);
+        return 4;
+    }
+    std::fclose(fin);
+
+    BitGrid grid_a, grid_b;
+    grid_a.resize(N);
+    grid_b.resize(N);
+    bytes_to_bitgrid(cells, grid_a);
+    cells.clear();
+    cells.shrink_to_fit();
+
+    BitGrid* cur = &grid_a;
+    BitGrid* next = &grid_b;
+
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 1;
+    unsigned T = std::min<unsigned>(hw, 8u);
+    if ((int)T > N) T = (unsigned)N;
+
+    std::vector<int> row_lo(T), row_hi(T);
+    for (unsigned t = 0; t < T; ++t) {
+        row_lo[t] = (int)((uint64_t)t * N / T);
+        row_hi[t] = (int)((uint64_t)(t + 1) * N / T);
+    }
+
+    const BitGrid* shared_src = nullptr;
+    BitGrid* shared_dst = nullptr;
+    bool stop = false;
+
+    std::barrier bar_start(T);
+    std::barrier bar_done(T);
+
+    std::vector<std::thread> pool;
+    pool.reserve(T - 1);
+    for (unsigned t = 1; t < T; ++t) {
+        pool.emplace_back([&, t]() {
+            for (;;) {
+                bar_start.arrive_and_wait();
+                if (stop) return;
+                step_rows_bitplane(*shared_src, *shared_dst, row_lo[t], row_hi[t]);
+                bar_done.arrive_and_wait();
+            }
+        });
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    for (int gen = 0; gen < generations; ++gen) {
+        shared_src = cur;
+        shared_dst = next;
+        bar_start.arrive_and_wait();
+        step_rows_bitplane(*cur, *next, row_lo[0], row_hi[0]);
+        bar_done.arrive_and_wait();
+        std::swap(cur, next);
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    std::printf("%.3f ms\n", std::chrono::duration<double, std::milli>(t1 - t0).count());
+
+    stop = true;
+    bar_start.arrive_and_wait();
+    for (auto& th : pool) th.join();
+
+    bitgrid_to_bytes(*cur, cells);
+
+    FILE* fout = std::fopen(argv[2], "wb");
+    if (!fout) {
+        std::fprintf(stderr, "Error: cannot open output file '%s'\n", argv[2]);
+        return 5;
+    }
+    if (std::fwrite(&width, sizeof(uint64_t), 1, fout) != 1 ||
+        std::fwrite(&height, sizeof(uint64_t), 1, fout) != 1 ||
+        std::fwrite(cells.data(), 1, Ncells, fout) != Ncells) {
+        std::fprintf(stderr, "Error: write error on output file '%s'\n", argv[2]);
+        std::fclose(fout);
+        return 6;
+    }
+    std::fclose(fout);
+    return 0;
+}

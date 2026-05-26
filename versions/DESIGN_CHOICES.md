@@ -175,6 +175,40 @@ lookup table is branchless, but it is still a scalar indexed load per cell. The
 branchless compare/select form exposes the rule as arithmetic and comparisons,
 which is easier for the compiler to optimize and is a better shape for explicit
 SIMD later.
+
+## 12 Bitplane Representation
+
+Version 12 pivots from byte-per-cell storage to two bitplanes:
+
+```text
+s0 = low state bit
+s1 = high state bit
+ADULT = s0 & s1
+```
+
+Each `uint64_t` word stores 64 horizontal cells. The kernel computes neighbor
+counts and state transitions with bitwise operations over whole words.
+
+**Chosen over** continuing to optimize byte-per-cell `uint8_t` grids.
+
+Reason: the competition is performance-focused and the target grid can be
+32,768 x 32,768. Bitplanes reduce grid-state memory by 4x and expose 64-way
+word-level parallelism even before explicit ARM SIMD. The tradeoff is a more
+complex kernel and byte<->bitplane transposition at input/output boundaries.
+
+## 13 Bitplane Row-Sum Ring
+
+Version 13 adds a 5-slot ring buffer of horizontal row sums to the bitplane
+kernel. Each source row's 5-wide horizontal adult sum is represented as three
+bitplanes and reused while computing neighboring output rows.
+
+**Chosen over** v12's direct recomputation of all shifted adult masks for every
+output row.
+
+Reason: adjacent output rows reuse the same source-row horizontal sums. The ring
+buffer preserves the same O(generations * cells) simulation but removes repeated
+horizontal work. This is the bitplane equivalent of the row-sum reuse we learned
+from the byte-grid versions, adapted to a word-parallel representation.
  
 ## Keep Binary Cell Storage For Now (Need to check this after we implement SIMD. Not sure which one might be better)
 
