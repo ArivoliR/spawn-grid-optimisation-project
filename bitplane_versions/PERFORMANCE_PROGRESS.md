@@ -19,6 +19,7 @@ byte-grid ladder remains in `versions/PERFORMANCE_PROGRESS.md`.
 | vb10 | `bitplane_versions/10_bitplane_neon_predicate_huge.cpp` | `vb09` plus compact rule predicates and Linux transparent huge-page hints. |
 | vb11 | `bitplane_versions/11_bitplane_temporal_stripe.cpp` | Experimental full-width row-stripe temporal blocking with `K=4`, `H=64`. |
 | vb12 | `bitplane_versions/12_bitplane_temporal_ring.cpp` | Faster temporal stripe using a slab-local 5-row H ring, with the `k_this` writeback fix. |
+| vb13 | `bitplane_versions/13_bitplane_eor3_aligned.cpp` | Minimal `vb10` improvement: SHA3 `EOR3` plus 64-byte aligned vector storage, without explicit CPU pinning. |
 
 All versions keep the same CLI and binary I/O format:
 
@@ -189,6 +190,15 @@ rows are copied from `2 * k_this`, not always from `2 * TIME_K`. This matters
 for arbitrary generation counts even though the 10000-generation benchmark is
 divisible by 4.
 
+`vb13` is the cleaned-up form of the direct `vb10` feature experiments. The
+archived intermediate files are in `bitplane_versions/experiments_v13_v15/`.
+Measurements on the 32768x32768 boundary workload showed EOR3 helped modestly,
+explicit CPU pinning did not help under `taskset`, and aligned vector storage was
+the main useful addition. `vb13` therefore keeps EOR3 and aligned storage, and
+removes explicit pinning. The large remaining feature from the 130s contender is
+the byte-lane NEON H-row adder tree, which is a representation/kernel rewrite
+rather than a small patch to the `uint64x2_t` `vb10` kernel.
+
 ## Correctness Notes
 
 Current `vb04`/`vb05` checks against the reference:
@@ -279,6 +289,13 @@ Build the temporal-ring experiment on AWS:
 ```bash
 g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread \
   bitplane_versions/12_bitplane_temporal_ring.cpp -o /tmp/vb12
+```
+
+Build the cleaned direct `vb10` improvement on AWS:
+
+```bash
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread \
+  bitplane_versions/13_bitplane_eor3_aligned.cpp -o /tmp/vb13
 ```
 
 Compare against `vb03` on a public grid:
