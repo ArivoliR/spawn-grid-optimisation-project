@@ -85,6 +85,39 @@ Tile 512 is effectively full-width for a 32768-wide grid (`32768 / 64 = 512`
 words), so it is comparable to `vb03` and within local noise. The smaller tiles
 were slower locally.
 
+### 32768x32768, 10000 Generations, Target Graviton4 Boundary Input
+
+These runs were measured on the AWS Graviton4 target with:
+
+- Compiler: `g++-14`
+- Flags: `-std=c++23 -O3 -mcpu=neoverse-v2` or `-mcpu=neoverse-v2+sha3` where
+  SHA3 `EOR3` intrinsics are used
+- Affinity: `taskset -c 0-7`
+- Input: `/tmp/input_32768_boundary.bin`
+- Correctness: compared byte-for-byte against the best known correct output
+  for that run family
+
+| Version / experiment | Time | Notes |
+|---|---:|---|
+| vb03 scalar bitplane ring split | 282189.153 ms | Pre-explicit-NEON baseline on target |
+| vb06 NEON ripple | 204685.173 ms | First explicit NEON port |
+| vb07 NEON vertical slide | 182156.612 ms | Running vertical count |
+| vb09 NEON block-H buffer | 170286.970 ms | L2-sized block-H scratch |
+| vb10 compact predicate + huge-page hints | 162803.725 ms | First vb10 run |
+| vb10 compact predicate + huge-page hints | 161781.177 ms | Later same-input rerun |
+| vb11 temporal stripe, block-H slab | 163317.298 ms | Correct but slower than vb10 |
+| vb12 temporal stripe, H-ring slab | ~156000 ms | Correct contender run, before cleanup |
+| vb13 EOR3 + aligned storage, no pinning | 149701.896 ms | Current minimal cleaned candidate |
+| EOR3-only experiment | 158443.486 ms | Archived experiment; isolated EOR3 effect |
+| EOR3 + pinning experiment | 160163.706 ms | Archived experiment; pinning did not help under `taskset` |
+| EOR3 + pinning + aligned experiment | 149408.142 ms | Archived experiment; aligned storage supplied most of the win |
+
+The main target-side lesson is that aligned storage was a larger win than EOR3
+alone in the `uint64x2_t` kernel, while explicit thread pinning was neutral or
+slightly negative when the process was already launched with `taskset`. The
+byte-lane H-tree approach is still a larger kernel rewrite than the minimal
+`vb13` cleanup.
+
 ## x86 AVX2 SIMD Experiment
 
 These numbers came from a separate local AVX2 experiment, not from files in this
