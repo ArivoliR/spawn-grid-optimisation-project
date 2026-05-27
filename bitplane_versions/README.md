@@ -42,6 +42,22 @@ in `versions/`.
 - `13_bitplane_eor3_aligned.cpp`: minimal `vb10` improvement. Keeps SHA3
   `EOR3` in the vertical add/sub chains and 64-byte aligned vector storage;
   leaves out explicit CPU pinning because it showed no benefit under `taskset`.
+- `14_bitplane_byte_h4_compact.cpp`: adds the byte-lane NEON rewrite. Rows are
+  processed as `uint8x16_t` registers, the H-row kernel uses a `FA+FA+HA`
+  adder tree unrolled by 4, `vextq_u8` carries are shared for left and right
+  shifts, and the state transition derives next low/high bitplanes directly.
+- `15_bitplane_fused_slide.cpp`: experiment fusing `V - H_out + H_in` into a
+  single bit-sliced update. Correct but slower than `vb14` on the first target
+  benchmark; kept as a documented data point.
+- `16_bitplane_v_interleaved.cpp`: keeps the `vb14` kernel and changes only
+  the V scratch layout so all five bitplanes for register `r` are stored
+  adjacent (`v0[r], v1[r], v2[r], v3[r], v4[r]`), improving hot-path locality
+  in the slide loop.
+- `17_bitplane_h_interleaved.cpp`: applies the same interleaving to H scratch
+  (`h0[r], h1[r], h2[r]` adjacent per register per H row), and also drops the
+  `nc1` intermediate in `apply_rule_byte`, replaces the `next_high` expression
+  with `vxor3_u8` (EOR3), and replaces `next_low` with `vbcaxq_u8` (BCAX) on
+  SHA3-capable CPUs.
 - `experiments_v13_v15/`: archived one-by-one experiments for EOR3, pinning,
   and aligned storage.
 
