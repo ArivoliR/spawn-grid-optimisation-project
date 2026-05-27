@@ -20,6 +20,9 @@ Bitplane versions are named `vbNN` in the notes:
 - `vb11` -> `11_bitplane_temporal_stripe.cpp`
 - `vb12` -> `12_bitplane_temporal_ring.cpp`
 - `vb13` -> `13_bitplane_eor3_aligned.cpp`
+- `vb14` -> `14_bitplane_byte_h4_compact.cpp`
+- `vb15` -> `15_bitplane_fused_slide.cpp`
+- `vb16` -> `16_bitplane_v_interleaved.cpp`
 
 ## vb01: Bitplane Scalar Kernel
 
@@ -328,6 +331,114 @@ changes.
 This remains the `uint64x2_t` block-H design from `vb10`; it does not adopt the
 larger byte-lane H-row kernel rewrite.
 
+## vb14: Byte-Lane NEON H Tree
+
+`vb14` adds the best measured byte-lane NEON experiment to the numbered
+version ladder. It keeps the same block-H plus vertical-slide algorithmic
+structure as `vb13`, but changes the hot representation and H-row kernel:
+
+- bitplane rows are accessed as `uint8x16_t` vectors, one register per 128
+  cells
+- horizontal shifts use `vextq_u8` plus byte shifts instead of `uint64_t`
+  word-stitching
+- the horizontal 5-cell adult count uses a `FA + FA + HA` tree
+- the H-row kernel is unrolled by four registers
+- the two `vextq_u8` carry vectors are shared for `x-1/x-2` and `x+1/x+2`
+- the state transition directly derives next low/high bitplanes instead of
+  materializing EMPTY/EGG/JUVENILE masks
+
+Chosen over: keeping `vb13` as the final candidate.
+
+Reason: target measurements showed the byte-lane mapping is a larger win than
+the smaller EOR3/alignment tweaks in the `uint64x2_t` kernel. It gives the
+compiler and hardware a cleaner ARM NEON shape for the horizontal H fill while
+preserving row-major locality for the vertical slide. On the 32768x32768
+boundary workload, observed full-run time improved from `vb13 = 149701.896 ms`
+to `vb14 = 127231.528 ms`, with a fresh rerun at `130412.640 ms`.
+
+Rejected follow-ups that were tested before adding `vb14`:
+
+- register-column V traversal: destroyed row-major locality and regressed
+- software prefetch: neutral/slower
+- direct vertical recompute: more add work outweighed scratch savings
+- K=2 temporal slab: correct but slower
+- explicit pinning: worse under `taskset -c 0-7`
+- H-row unroll by 8: extra register pressure outweighed ILP
+- two-row slide variants: reduced V scratch traffic but increased dependency
+  pressure
+
+Constraint note: `vb14` currently requires `N` divisible by 128 so each row is a
+whole number of NEON registers. The tested target/public sizes satisfy this. If
+the final input contract allows smaller valid powers of two, add a fallback
+before making this the submitted `spawn_sim.cpp`.
+
+## vb15: Fused Vertical Slide Experiment
+
+`vb15` starts from `vb14` and changes only the hottest vertical-slide
+update. The current hot path is:
+
+```cpp
+v = sub_v5_h3(v, h_out);
+v = add_v5_h3(v, h_in);
+```
+
+The tested replacement is a fused bit-sliced update:
+
+```cpp
+v = slide_v5_h3_h3(v, h_out, h_in);
+```
+
+Chosen over: more H-row tuning or cache-only tuning.
+
+Reason: profiling `vb14` on the 32768 target showed roughly 68% of summed
+worker time in slide+rule and only about 31% in H fill. The H side already had
+the easy wins: byte-lane shifts, adder tree, H4 unroll, and shared `vext`.
+The remaining sub-110 gap needs a direct reduction in the slide phase. Fusing
+`V - H_out + H_in` may avoid duplicated carry/borrow propagation while keeping
+the same O(generations * cells) algorithm and the same row-major access pattern.
+
+Risk: this is a hand-written multi-bit bit-sliced arithmetic network. It needs
+truth-table/unit verification against `sub_v5_h3` followed by `add_v5_h3` before
+any full-grid benchmark.
+
+Status: correctness passed on the target smoke test, but the first 32768x32768
+/ 1000-generation benchmark regressed to `13223.584 ms`. `vb14` remains the
+current best. The likely reason is that the fused carry-save expression reduces
+one carry/borrow chain but adds enough boolean work and register pressure to
+lose throughput on Neoverse-V2.
+
+## vb16: Interleaved V Scratch
+
+`vb16` starts from `vb14` and keeps the architecture intentionally simple. The
+only kernel change is the layout of the running vertical count scratch.
+
+`vb14` stores the five bitplanes of `V` as five full rows:
+
+```text
+v_b0[all registers], v_b1[all registers], v_b2[all registers],
+v_b3[all registers], v_b4[all registers]
+```
+
+`vb16` stores one register's complete `V5` count together:
+
+```text
+v_b0[r], v_b1[r], v_b2[r], v_b3[r], v_b4[r],
+v_b0[r+1], v_b1[r+1], ...
+```
+
+Reason: the hot slide loop always consumes and writes all five `V` bitplanes for
+the same register. Keeping those five vectors adjacent is a direct memory-layout
+improvement and is easy to defend in review: the loop order, arithmetic, H
+scratch, rule predicate, and generation schedule are unchanged. The code only
+changes where the scratch vectors live.
+
+Measured result on the target 32768x32768 boundary workload:
+
+```text
+vb14 best observed: 127231.528 ms
+vb16 block 96, -Ofast: 120843.475 ms
+```
+
 ## SIMD Direction: Prefer Widening Before Tree Reduction
 
 Local x86 AVX2 experiments compared two SIMD shapes:
@@ -347,10 +458,3 @@ tree-vs-ripple adder structure. Neoverse-V2 is also an out-of-order core with
 wide NEON throughput and register renaming, so the x86 null result may transfer
 better than expected. Tree reduction remains correct and useful to keep around,
 but it should not block the NEON port.
-
-## Current Next Step
-
-Use `vb13` as the minimal cleaned candidate for the current line. The next major
-performance direction is a byte-lane NEON horizontal row-sum kernel with an
-adder tree, but that is a larger kernel rewrite rather than another small patch
-to the `uint64x2_t` `vb10`/`vb13` implementation.
