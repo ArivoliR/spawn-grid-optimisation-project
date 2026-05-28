@@ -23,6 +23,7 @@ Bitplane versions are named `vbNN` in the notes:
 - `vb14` -> `14_bitplane_byte_h4_compact.cpp`
 - `vb15` -> `15_bitplane_fused_slide.cpp`
 - `vb16` -> `16_bitplane_v_interleaved.cpp`
+- `vb17` -> `17_bitplane_h_interleaved.cpp`
 
 ## vb01: Bitplane Scalar Kernel
 
@@ -438,6 +439,80 @@ Measured result on the target 32768x32768 boundary workload:
 vb14 best observed: 127231.528 ms
 vb16 block 96, -Ofast: 120843.475 ms
 ```
+
+## vb17: Interleaved H Scratch + apply_rule_byte Micro-Opts
+
+`vb17` applies the same interleaving principle to H scratch that `vb16` applied
+to V scratch, and folds two small instruction-count reductions into
+`apply_rule_byte`.
+
+**Change 1 — H scratch interleaved layout:**
+
+`vb16` stored the three H bitplanes for each H row `i` as three separate
+full-width planes:
+
+```text
+h0 for H row i: h_data + (3*i+0)*row_bytes
+h1 for H row i: h_data + (3*i+1)*row_bytes
+h2 for H row i: h_data + (3*i+2)*row_bytes
+```
+
+For `N = 32768`, `row_bytes = 4096`. The three 16-byte vectors for a given
+register `r` are therefore 4096 bytes apart. Every load of a complete `Sum3`
+crosses three distinct cache lines, and the 4096-byte stride causes cache-set
+conflicts on the Neoverse-V2 4-way 64 KiB L1d.
+
+`vb17` interleaves the three planes per register:
+
+```text
+h[i][r].h0  at hp(i) + r*48
+h[i][r].h1  at hp(i) + r*48 + 16
+h[i][r].h2  at hp(i) + r*48 + 32
+where hp(i) = h_data + i * 3 * row_bytes
+```
+
+Total scratch size is unchanged: `(BLOCK_ROWS+4) * 3 * row_bytes`. Each
+`Sum3` load or store now accesses 48 consecutive bytes — potentially a single
+64-byte cache line — instead of three addresses 4096 bytes apart.
+
+Chosen over: keeping the plane layout from vb16.
+
+Reason: the slide loop (hot path) loads `h_out` and `h_in` for the current
+register before every `sub_v5_h3` / `add_v5_h3` call. With the plane layout
+those six 16-byte loads hit three separate 4096-byte-stride addresses per H
+row (two H rows per slide step = 6 distinct 4096-stride cache-line accesses
+per register per output row). With interleaving, the same six loads are two
+48-byte sequential reads.
+
+**Change 2 — apply_rule_byte micro-opts:**
+
+Three instruction-level improvements, all proven algebraically:
+
+1. **Remove `nc1 = vmvnq_u8(v.b1)`**: `born_b = vandq_u8(v.b2, nc1)` was the
+   only use of `nc1`. Replaced with `born_b = vbicq_u8(v.b2, v.b1)`, saving
+   one `MVNI` per `apply_rule_byte` call.
+
+2. **`next_high` via EOR3**: Was `vorrq_u8(veorq_u8(high, low), adult_r)`.
+   Because `adult_r` requires `low=1 AND high=1`, and `high XOR low = 0`
+   wherever both are 1, the two terms are disjoint and `OR == XOR`. So
+   `(high ^ low) | adult_r == high ^ low ^ adult_r`, which maps to a single
+   `EOR3` on sha3-capable CPUs via the existing `vxor3_u8` wrapper.
+
+3. **`next_low` via BCAX**: Was `vorrq_u8(vbicq_u8(high|born, low), adult_r)`.
+   `adult_r` requires `low=1`; `(high|born) & ~low` requires `~low`. The two
+   terms are disjoint, so `OR == XOR == BCAX`. `vbcaxq_u8(adult_r, high|born,
+   low)` computes `adult_r ^ ((high|born) & ~low)` in one instruction on
+   sha3-capable CPUs. Guarded with `#if defined(__ARM_FEATURE_SHA3)`.
+
+Measured result on the target 32768x32768 boundary workload (two runs each):
+
+```text
+vb16 block 96, -Ofast: 120416.799 ms / 120469.461 ms
+vb17 block 96, -Ofast: 117625.887 ms / 117367.164 ms  (best: 117367 ms, ~2.5% faster)
+vb17 block 128, -Ofast: 119663.212 ms
+```
+
+`cmp` against vb16 output on 1-generation run: byte-identical.
 
 ## SIMD Direction: Prefer Widening Before Tree Reduction
 

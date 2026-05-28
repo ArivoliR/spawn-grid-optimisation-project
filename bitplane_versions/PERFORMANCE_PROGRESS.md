@@ -23,6 +23,7 @@ byte-grid ladder remains in `versions/PERFORMANCE_PROGRESS.md`.
 | vb14 | `bitplane_versions/14_bitplane_byte_h4_compact.cpp` | Adds the best target-side byte-lane NEON experiment: H-row adder tree, H unroll by 4, shared `vext`, compact next-state boolean. |
 | vb15 | `bitplane_versions/15_bitplane_fused_slide.cpp` | Tests a fused carry-save vertical slide update for `V = V - H_out + H_in`; correct, but slower than `vb14` in the first target benchmark. |
 | vb16 | `bitplane_versions/16_bitplane_v_interleaved.cpp` | Cleaner follow-up to `vb14`: stores the five vertical-count scratch planes as adjacent per-register `V5` records. |
+| vb17 | `bitplane_versions/17_bitplane_h_interleaved.cpp` | Applies the same interleaving to H scratch (h0/h1/h2 adjacent per register per row), plus three micro-opts in `apply_rule_byte`: drop `nc1`, EOR3 for `next_high`, BCAX for `next_low`. |
 
 All versions keep the same CLI and binary I/O format:
 
@@ -116,6 +117,10 @@ These runs were measured on the AWS Graviton4 target with:
 | vb15 fused vertical slide | 13223.584 ms for 1000 gens | Correct, but slower than vb14's best 1000-gen runs |
 | vb16 V-interleaved scratch, block 128, `-O3` | 12244.251 ms for 1000 gens | Clean architecture; one scratch-layout change over vb14 |
 | vb16 V-interleaved scratch, block 96, `-Ofast` | 120843.475 ms | Full 10000-gen run; correct output; clean candidate |
+| vb16 V-interleaved scratch, block 96, `-Ofast` | 120416.799 ms | Rerun same day as vb17 baseline; consistent |
+| vb17 H+V interleaved scratch + apply_rule micro-opts, block 96, `-Ofast` | 117625.887 ms | First run; `cmp` clean vs vb16 output |
+| vb17 H+V interleaved scratch + apply_rule micro-opts, block 96, `-Ofast` | 117367.164 ms | Second run; consistent; ~2.5% faster than vb16 |
+| vb17 H+V interleaved scratch + apply_rule micro-opts, block 128, `-Ofast` | 119663.212 ms | Default block size; b96 remains best |
 | EOR3-only experiment | 158443.486 ms | Archived experiment; isolated EOR3 effect |
 | EOR3 + pinning experiment | 160163.706 ms | Archived experiment; pinning did not help under `taskset` |
 | EOR3 + pinning + aligned experiment | 149408.142 ms | Archived experiment; aligned storage supplied most of the win |
@@ -280,6 +285,20 @@ Correctness passed, but the first target benchmark regressed to
 appears to add enough boolean work/register pressure to outweigh the shorter
 carry chain.
 
+`vb17` applies the same interleaving principle to H scratch that `vb16` applied
+to V scratch. In `vb16` the three H bitplanes for a register `r` in H row `i`
+are 4096 bytes apart (one per full-width plane), causing cache-set conflicts on
+the Neoverse-V2 L1d. `vb17` stores `h0[r], h1[r], h2[r]` as 48 consecutive
+bytes at `hp(i) + r*48`, collapsing the slide loop's 6 strided H loads into 2
+sequential 48-byte reads. The `apply_rule_byte` function also drops the
+`nc1 = vmvnq_u8(v.b1)` intermediate (replaced by `vbicq_u8(v.b2, v.b1)`),
+uses `vxor3_u8` (EOR3) for `next_high` (disjointness proof: `adult_r` requires
+`low=high=1`, so `high^low=0` there, making XOR and OR equivalent), and uses
+`vbcaxq_u8` (BCAX) for `next_low` on SHA3 CPUs (same disjointness argument vs
+`(high|born)&~low`). On the 32768x32768 boundary workload, this measured
+117367–117626 ms with `block 96, -Ofast`, about 2.5% faster than vb16's
+120417–120843 ms range. Output is byte-identical to vb16.
+
 `vb16` keeps the `vb14` kernel shape and changes only the vertical-count scratch
 layout. `vb14` stores the running `V` count as five full-row bitplanes:
 
@@ -334,7 +353,7 @@ Current target build shape:
 ```bash
 g++-14 -std=c++23 -Ofast -mcpu=neoverse-v2+sha3 -pthread \
   -DSPAWN_BLOCK_ROWS=96 \
-  bitplane_versions/16_bitplane_v_interleaved.cpp -o spawn_sim
+  bitplane_versions/17_bitplane_h_interleaved.cpp -o spawn_sim
 ```
 
 Build the column-tiled experiment with a chosen tile width:
@@ -418,6 +437,16 @@ g++-14 -std=c++23 -Ofast -mcpu=neoverse-v2+sha3 -pthread \
   bitplane_versions/16_bitplane_v_interleaved.cpp -o /tmp/vb16
 taskset -c 0-7 /tmp/vb16 /tmp/input_32768_boundary.bin /tmp/vb16_32768.bin 10000
 cmp /tmp/output_vb14_32768.bin /tmp/vb16_32768.bin
+```
+
+Build the H+V interleaved scratch candidate on AWS:
+
+```bash
+g++-14 -std=c++23 -Ofast -mcpu=neoverse-v2+sha3 -pthread \
+  -DSPAWN_BLOCK_ROWS=96 \
+  bitplane_versions/17_bitplane_h_interleaved.cpp -o /tmp/vb17
+taskset -c 0-7 /tmp/vb17 /tmp/input_32768_boundary.bin /tmp/vb17_32768.bin 10000
+cmp /tmp/vb16_32768.bin /tmp/vb17_32768.bin
 ```
 
 Compare against `vb03` on a public grid:
