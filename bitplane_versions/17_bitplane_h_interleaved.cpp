@@ -74,7 +74,7 @@ static constexpr uint8_t JUVENILE = 2;
 static constexpr uint8_t ADULT    = 3;
 
 #ifndef SPAWN_BLOCK_ROWS
-#define SPAWN_BLOCK_ROWS 128
+#define SPAWN_BLOCK_ROWS 96
 #endif
 static constexpr int BLOCK_ROWS = SPAWN_BLOCK_ROWS;
 
