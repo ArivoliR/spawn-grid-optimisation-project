@@ -597,9 +597,9 @@ int main(int argc, char* argv[])
         std::fclose(fin);
         return 3;
     }
-    if (width == 0 || width != height || (width % 128) != 0) {
+    if (width == 0 || width != height || (width % 4) != 0) {
         std::fprintf(stderr,
-            "Error: grid must be square, non-empty, divisible by 128, got %" PRIu64 " x %" PRIu64 "\n",
+            "Error: grid must be square, non-empty, divisible by 4, got %" PRIu64 " x %" PRIu64 "\n",
             width, height);
         std::fclose(fin);
         return 3;
