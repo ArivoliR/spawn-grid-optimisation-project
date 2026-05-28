@@ -3,6 +3,7 @@
 #include <barrier>
 #include <chrono>
 #include <cinttypes>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -29,27 +30,6 @@ static inline uint8x16_t vxor3_u8(uint8x16_t a, uint8x16_t b, uint8x16_t c)
 #else
     return veorq_u8(veorq_u8(a, b), c);
 #endif
-}
-
-static inline uint8x16_t shl_row_1(uint8x16_t prev, uint8x16_t curr)
-{
-    const uint8x16_t carry = vextq_u8(prev, curr, 15);
-    return vorrq_u8(vshlq_n_u8(curr, 1), vshrq_n_u8(carry, 7));
-}
-static inline uint8x16_t shl_row_2(uint8x16_t prev, uint8x16_t curr)
-{
-    const uint8x16_t carry = vextq_u8(prev, curr, 15);
-    return vorrq_u8(vshlq_n_u8(curr, 2), vshrq_n_u8(carry, 6));
-}
-static inline uint8x16_t shr_row_1(uint8x16_t curr, uint8x16_t next)
-{
-    const uint8x16_t carry = vextq_u8(curr, next, 1);
-    return vorrq_u8(vshrq_n_u8(curr, 1), vshlq_n_u8(carry, 7));
-}
-static inline uint8x16_t shr_row_2(uint8x16_t curr, uint8x16_t next)
-{
-    const uint8x16_t carry = vextq_u8(curr, next, 1);
-    return vorrq_u8(vshrq_n_u8(curr, 2), vshlq_n_u8(carry, 6));
 }
 
 static inline uint8x16_t maj_u8(uint8x16_t a, uint8x16_t b, uint8x16_t c)
@@ -559,8 +539,8 @@ int main(int argc, char* argv[])
     if (argc == 4) {
         char* end;
         long g = std::strtol(argv[3], &end, 10);
-        if (*end != '\0' || g <= 0) {
-            std::fprintf(stderr, "Error: generations must be a positive integer\n");
+        if (*end != '\0' || g <= 0 || g > INT_MAX) {
+            std::fprintf(stderr, "Error: generations must be a positive integer in [1, %d]\n", INT_MAX);
             return 1;
         }
         generations = (int)g;
