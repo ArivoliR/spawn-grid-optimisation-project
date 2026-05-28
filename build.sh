@@ -4,7 +4,7 @@
 set -euo pipefail
 
 CXX="${CXX:-g++-14}"
-CXXFLAGS="${CXXFLAGS:--std=c++23 -Ofast -mcpu=neoverse-v2+sha3 -pthread -Wall -Wextra}"
+CXXFLAGS="${CXXFLAGS:--std=c++23 -Ofast -mcpu=neoverse-v2+sha3 -pthread -Wall -Wextra -DSPAWN_BLOCK_ROWS=88}"
 OUTPUT="${OUTPUT:-spawn_sim}"
 
 echo "Building spawn_sim with $CXX ..."

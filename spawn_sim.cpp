@@ -1,5 +1,3 @@
-//   g++-14 -std=c++23 -Ofast -mcpu=neoverse-v2+sha3 -pthread spawn_sim.cpp -o /spawn_sim
-
 #include <algorithm>
 #include <arm_neon.h>
 #include <barrier>
@@ -23,10 +21,6 @@ static constexpr uint8_t ADULT    = 3;
 #define SPAWN_BLOCK_ROWS 96
 #endif
 static constexpr int BLOCK_ROWS = SPAWN_BLOCK_ROWS;
-
-// =====================================================================
-// NEON helpers (identical to vb16)
-// =====================================================================
 
 static inline uint8x16_t vxor3_u8(uint8x16_t a, uint8x16_t b, uint8x16_t c)
 {
@@ -141,10 +135,6 @@ static inline void store_v5_interleaved(uint8_t* v_data, size_t reg_byte_off, V5
     vst1q_u8(v_data + off + 64, v.b4);
 }
 
-// apply_rule_byte: vb17 variant.
-//   - nc1 removed; born_b uses vbicq_u8(v.b2, v.b1) directly
-//   - next_high uses vxor3_u8 (EOR3 on sha3 CPUs; OR-after-XOR proven equivalent)
-//   - next_low uses vbcaxq_u8 on sha3 CPUs (BCAX proven equivalent; OR otherwise)
 struct LH { uint8x16_t low, high; };
 static inline LH apply_rule_byte(V5 v, uint8x16_t low, uint8x16_t high)
 {
@@ -175,10 +165,6 @@ static inline LH apply_rule_byte(V5 v, uint8x16_t low, uint8x16_t high)
     return { next_low, next_high };
 }
 
-// =====================================================================
-// Hugepage hint
-// =====================================================================
-
 static void advise_huge_pages(void* ptr, size_t bytes)
 {
 #ifdef __linux__
@@ -194,10 +180,6 @@ static void advise_huge_pages(void* ptr, size_t bytes)
     (void)ptr; (void)bytes;
 #endif
 }
-
-// =====================================================================
-// 64-byte aligned allocator
-// =====================================================================
 
 template <class T, size_t Alignment>
 struct AlignedAllocator {
@@ -233,10 +215,6 @@ bool operator!=(const AlignedAllocator<T, Alignment>&,
 
 using AlignedBytes = std::vector<uint8_t, AlignedAllocator<uint8_t, 64>>;
 
-// =====================================================================
-// BitGrid (byte-packed)
-// =====================================================================
-
 struct BitGrid {
     int n = 0;
     int row_bytes = 0;
@@ -258,10 +236,6 @@ struct BitGrid {
     uint8_t* row0(int y) { return s0.data() + (size_t)y * row_bytes; }
     uint8_t* row1(int y) { return s1.data() + (size_t)y * row_bytes; }
 };
-
-// =====================================================================
-// Bytes <-> bitgrid conversion
-// =====================================================================
 
 static void bytes_to_bitgrid(const std::vector<uint8_t>& cells, BitGrid& out)
 {
@@ -303,15 +277,8 @@ static void bitgrid_to_bytes(const BitGrid& in, std::vector<uint8_t>& cells)
     }
 }
 
-// =====================================================================
-// H-row tree adder — interleaved output layout.
-//
-// Writes to h_out with stride 48 bytes per register:
-//   h_out + r*48     : h.h0 (16 bytes)
-//   h_out + r*48+16  : h.h1 (16 bytes)
-//   h_out + r*48+32  : h.h2 (16 bytes)
-// =====================================================================
-
+// Per-row 5-wide horizontal adult sum. Writes 3 result planes interleaved
+// per register: r*48 = h0, +16 = h1, +32 = h2.
 static inline void compute_H_row(const uint8_t* __restrict__ low_row,
                                  const uint8_t* __restrict__ high_row,
                                  int R_REGS,
@@ -362,12 +329,6 @@ static inline void compute_H_row(const uint8_t* __restrict__ low_row,
     }
 }
 
-// =====================================================================
-// Per-thread persistent scratch.
-//   h_store     : (BLOCK_ROWS+4) * 3 * row_bytes bytes, H interleaved layout
-//   vcount_store: 5 * row_bytes bytes, V interleaved layout (from vb16)
-// =====================================================================
-
 struct ThreadScratch {
     AlignedBytes h_store;
     AlignedBytes vcount_store;
@@ -381,10 +342,6 @@ struct ThreadScratch {
     }
 };
 
-// =====================================================================
-// Block-H step kernel.
-// =====================================================================
-
 static void step_rows_bitplane(const BitGrid& src, BitGrid& dst,
                                int y0, int y1, ThreadScratch& scratch)
 {
@@ -396,8 +353,6 @@ static void step_rows_bitplane(const BitGrid& src, BitGrid& dst,
     uint8_t* h_data = scratch.h_store.data();
     uint8_t* v_data = scratch.vcount_store.data();
 
-    // hp(i): base pointer for H row i in the interleaved scratch.
-    // Within row i, register r: h0 at hp(i)+r*48, h1 at +16, h2 at +32.
     auto hp = [&](int i) -> uint8_t* {
         return h_data + (size_t)i * 3 * row_bytes;
     };
@@ -407,19 +362,17 @@ static void step_rows_bitplane(const BitGrid& src, BitGrid& dst,
         const int block_rows = b1 - b0;
         const int h_rows    = block_rows + 4;
 
-        // ---- Pass 1: materialise H rows [b0-2 .. b0+block_rows+1]. ----
         for (int i = 0; i < h_rows; ++i) {
             const int y = (b0 - 2 + i + N) & ymask;
             compute_H_row(src.row0(y), src.row1(y), R_REGS, hp(i));
         }
 
-        // ---- Pass 2: initial V = sum of H[0..4]. Unrolled by 2 in r. ----
+        // Initial V = sum of H[0..4].
         {
             int r = 0;
             for (; r + 1 < R_REGS; r += 2) {
                 const size_t off0 = (size_t)r * 16;
                 const size_t off1 = (size_t)(r + 1) * 16;
-                // H interleaved: r*48 = off0*3
                 const uint8_t* p0 = hp(0) + off0 * 3;
                 const uint8_t* p1 = hp(0) + off1 * 3;
                 V5 v0 = {
@@ -457,7 +410,7 @@ static void step_rows_bitplane(const BitGrid& src, BitGrid& dst,
             }
         }
 
-        // ---- Apply rule to first output row. Unrolled by 2 in r. ----
+        // First output row.
         {
             const uint8_t* low_row  = src.row0(b0);
             const uint8_t* high_row = src.row1(b0);
@@ -492,8 +445,7 @@ static void step_rows_bitplane(const BitGrid& src, BitGrid& dst,
             }
         }
 
-        // ---- Slide V down through the block, applying rule per output row.
-        //      Unrolled by 2 in r. Hot path. ----
+        // Slide V down through the block.
         for (int k = 1; k < block_rows; ++k) {
             const uint8_t* h_out_row = hp(k - 1);
             const uint8_t* h_in_row  = hp(k + 4);
@@ -511,7 +463,6 @@ static void step_rows_bitplane(const BitGrid& src, BitGrid& dst,
                 V5 v0 = load_v5_interleaved(v_data, off0);
                 V5 v1 = load_v5_interleaved(v_data, off1);
 
-                // H interleaved: contiguous 48-byte loads per register
                 const uint8_t* ho_p0 = h_out_row + off0 * 3;
                 const uint8_t* ho_p1 = h_out_row + off1 * 3;
                 const uint8_t* hi_p0 = h_in_row  + off0 * 3;
@@ -562,9 +513,40 @@ static void step_rows_bitplane(const BitGrid& src, BitGrid& dst,
     }
 }
 
-// =====================================================================
-// Main
-// =====================================================================
+// Scalar fallback for N < 128 (kernel requires one full NEON register per row).
+static int count_adults_scalar(const std::vector<uint8_t>& g, int N, int cx, int cy)
+{
+    int count = 0;
+    for (int dy = -2; dy <= 2; ++dy) {
+        int ny = (cy + dy + N) % N;
+        for (int dx = -2; dx <= 2; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            int nx = (cx + dx + N) % N;
+            if (g[(size_t)ny * N + nx] == ADULT) ++count;
+        }
+    }
+    return count;
+}
+
+static void step_scalar(const std::vector<uint8_t>& src,
+                        std::vector<uint8_t>& dst, int N)
+{
+    for (int y = 0; y < N; ++y) {
+        for (int x = 0; x < N; ++x) {
+            const int A = count_adults_scalar(src, N, x, y);
+            const uint8_t cell = src[(size_t)y * N + x];
+            uint8_t next;
+            switch (cell) {
+                case EMPTY:    next = (A >= 3 && A <= 5) ? EGG   : EMPTY; break;
+                case EGG:      next = JUVENILE;                            break;
+                case JUVENILE: next = ADULT;                               break;
+                case ADULT:    next = (A >= 4 && A <= 9) ? ADULT : EMPTY;  break;
+                default:       next = EMPTY;                               break;
+            }
+            dst[(size_t)y * N + x] = next;
+        }
+    }
+}
 
 int main(int argc, char* argv[])
 {
@@ -597,9 +579,9 @@ int main(int argc, char* argv[])
         std::fclose(fin);
         return 3;
     }
-    if (width == 0 || width != height || (width % 128) != 0) {
+    if (width == 0 || width != height) {
         std::fprintf(stderr,
-            "Error: grid must be square, non-empty, divisible by 128, got %" PRIu64 " x %" PRIu64 "\n",
+            "Error: grid must be square and non-empty, got %" PRIu64 " x %" PRIu64 "\n",
             width, height);
         std::fclose(fin);
         return 3;
@@ -615,6 +597,37 @@ int main(int argc, char* argv[])
         return 4;
     }
     std::fclose(fin);
+
+    if (N < 128) {
+        std::vector<uint8_t> sa = std::move(cells);
+        std::vector<uint8_t> sb((size_t)N * N);
+        std::vector<uint8_t>* cur_s  = &sa;
+        std::vector<uint8_t>* next_s = &sb;
+
+        auto t0s = std::chrono::steady_clock::now();
+        for (int gen = 0; gen < generations; ++gen) {
+            step_scalar(*cur_s, *next_s, N);
+            std::swap(cur_s, next_s);
+        }
+        auto t1s = std::chrono::steady_clock::now();
+        std::printf("%.3f ms\n",
+            std::chrono::duration<double, std::milli>(t1s - t0s).count());
+
+        FILE* foutS = std::fopen(argv[2], "wb");
+        if (!foutS) {
+            std::fprintf(stderr, "Error: cannot open output file '%s'\n", argv[2]);
+            return 5;
+        }
+        if (std::fwrite(&width,           sizeof(uint64_t), 1,      foutS) != 1 ||
+            std::fwrite(&height,          sizeof(uint64_t), 1,      foutS) != 1 ||
+            std::fwrite(cur_s->data(),    1, Ncells,                foutS) != Ncells) {
+            std::fprintf(stderr, "Error: write error on output file '%s'\n", argv[2]);
+            std::fclose(foutS);
+            return 6;
+        }
+        std::fclose(foutS);
+        return 0;
+    }
 
     BitGrid grid_a, grid_b;
     grid_a.resize(N);
