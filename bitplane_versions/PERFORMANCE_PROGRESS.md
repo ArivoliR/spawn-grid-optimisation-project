@@ -33,6 +33,9 @@ byte-grid ladder remains in `versions/PERFORMANCE_PROGRESS.md`.
 | vb28 | `bitplane_versions/28_single_pass_pairwise.cpp` | vb27 + vb25's pairwise neighbour sync. vb27's tighter inner loop made the global barrier relatively more expensive; pairwise atomic counters recover the threading loss. |
 | vb29 | `bitplane_versions/29_prefetch.cpp` | vb28 + software prefetch hints in the column loop (entering row, V scratch, ring, source). **Negative result** — the HW L2 prefetcher already handles the streaming pattern, and SW prefetches polluted the pipeline. |
 | vb30 | `bitplane_versions/30_peeled_boundary.cpp` | vb28 with the `(r + 2 < R_REGS) ? load(r+2) : load(0)` ternary peeled out into a separate boundary block, so the main loop's `adult_next_1` load is unconditional. **Negative result** — the compiler was already handling the conditional well; the peeled version regressed. |
+| vb31 | `bitplane_versions/31_column_strip.cpp` | Column-strip-major iteration: per thread, walk column strips of S=2 col regs, keeping V state in registers across all rows in the strip. Aimed to eliminate the V scratch round-trip (~12% of instructions). **Negative result** — column-major access on row-major src/dst data caused the L1 miss rate to jump from 4.83% to 15.87%. Cache penalty dwarfed the saved V loads. |
+| vb32 | `bitplane_versions/32_unroll4.cpp` | vb28 with 4-column unroll instead of 2 (40+ live V vectors per iter). **Negative result** — register spill regressed the wall by ~17%. |
+| vb33 | `bitplane_versions/33_fused_slide.cpp` | Combined `sub_v5_h3` + `add_v5_h3` into a single `slide_v5_h3` that interleaves the borrow and carry chains at the bit level, reducing combined dep depth from 10 to 6. **Marginal/neutral** — backend stalls dropped 10% (confirming the dep-chain reduction), but the OOO engine was already overlapping the chains via 2-col unroll, so wall time didn't improve. |
 
 All versions keep the same CLI and binary I/O format:
 
@@ -348,6 +351,9 @@ public_1_random_low_32768 input. Build flags noted per row.
 | **vb28 single-pass + pairwise sync** | **94538 ms** | tuned flags | -16.7% wall vs vb22. Pairwise atomic gen counters recover threading loss from vb27 (CPU util 5.98→6.61 at 500 gens). `cmp` clean vs vb22 32K output. 3 stable runs: 94538 / 94570 / 94518 ms. |
 | vb29 software prefetch | 97809 ms | tuned flags | **Regression** vs vb28. `__builtin_prefetch` 4 column-registers ahead on entering row + V + ring + src; HW L2 prefetcher already handled the streaming pattern, SW prefetch polluted the pipeline. Kept as a documented negative result. |
 | vb30 peeled boundary | 97120 ms | tuned flags | **Regression** vs vb28. Peeled the `(r+2 < R_REGS) ? load(r+2) : load(0)` ternary out into a separate boundary block. Compiler was already handling the conditional well — the peeled version added icache pressure without helping. |
+| vb31 column-strip | 160164 ms | tuned flags | **Large regression** vs vb28. Column-major iteration of row-major data: L1 miss rate jumped 4.83% → 15.87%, IPC dropped 3.21 → 2.28. The V scratch traffic we saved was much smaller than the cache penalty. |
+| vb32 4-col unroll | 110757 ms | tuned flags | **Regression** vs vb28. Register pressure (40+ live vectors per iter) caused spills. |
+| vb33 fused slide_v5 | 95912 ms | tuned flags | Neutral/marginal vs vb28. `sub_v5_h3` + `add_v5_h3` combined into single bit-interleaved ripple (dep depth 10 → 6). Backend stalls dropped 27.7% → 24.5% (confirming the dep chain reduction), but the 2-col unroll was already exposing enough ILP for the OOO engine; wall time held at ~95.9 s. |
 
 Per-counter snapshot (vb27, 500 gens at 32K x 8 threads):
 
@@ -534,11 +540,17 @@ g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
 g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
   bitplane_versions/28_single_pass_pairwise.cpp -o /tmp/vb28
 
-# vb29 / vb30: documented negative results (regressions)
+# vb29 / vb30 / vb31 / vb32 / vb33: documented experiments (mostly regressions or neutral)
 g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
   bitplane_versions/29_prefetch.cpp -o /tmp/vb29
 g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
   bitplane_versions/30_peeled_boundary.cpp -o /tmp/vb30
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/31_column_strip.cpp -o /tmp/vb31
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/32_unroll4.cpp -o /tmp/vb32
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/33_fused_slide.cpp -o /tmp/vb33
 ```
 
 Cross-check vb27 against vb22 on the 32K boundary input:

@@ -805,3 +805,109 @@ pressure and probably perturbed scheduling. Net regression.
 Both files are kept in the tree as documented negative results. They are
 the natural follow-ups any reader would propose, so leaving the data
 visible saves them the round trip.
+
+## vb31, vb32, vb33: Pushing Toward Sub-80s (Mostly Negative)
+
+Three further attempts targeting different parts of the kernel. Together
+they map out the local optimum that vb28 already sits at and the
+structural blockers preventing sub-80 s without a fundamentally
+different layout.
+
+### vb31 — column-strip iteration
+
+Hypothesis: ~12 % of all instructions are V scratch load/store ops
+(5 loads + 5 stores per col reg per row). Reorganise the iteration so V
+state lives in vector registers across rows: per thread, walk column
+strips of S = 2 col regs, and for each strip iterate all band rows. Per
+strip the H ring is stack-local (480 B, L1-resident), and V state stays
+in registers because the row loop only touches the strip's 2 cols.
+
+Result: vb28 94.5 s → vb31 160.2 s — a 70 % regression. Per-counter:
+
+```text
+              vb28      vb31
+IPC           3.21      2.28
+L1d miss %    4.83      15.87
+L2 miss %     3.4       29.5
+```
+
+Diagnosis: row-major `src` / `dst` layout means column-major iteration
+across all 4096 rows in a strip touches the src grid in a striped
+pattern (only 4 vectors per row, scattered across all rows). L1 misses
+exploded because the working set is 16 MiB of src data per strip versus
+64 KiB L1. The cache penalty completely eats the V scratch savings.
+
+This reproduces vb24's lesson: bitplane row-major layout doesn't tolerate
+column-strip iteration without a transpose, and transpose itself is too
+expensive per gen. The V scratch round-trip is L1-resident, so the
+savings were always smaller than the cost.
+
+### vb32 — 4-column unroll
+
+Hypothesis: the inner loop's 2-column unroll exposes two independent V5
+carry chains to the OOO engine. 4-column unroll would expose four.
+
+Result: vb28 94.5 s → vb32 110.8 s. Register pressure: 4 × V5 (20 vecs)
++ 4 × adult window (5 vecs) + 4 × h_old / h_new triples (24 vecs) +
+src / dst loads = 50+ live vectors against the 32 NEON register file. The
+compiler spilled aggressively, and the spill traffic dwarfed the ILP win.
+
+### vb33 — fused `slide_v5_h3`
+
+Hypothesis: `sub_v5_h3` followed by `add_v5_h3` is a serial dep chain of
+depth 10 (5 + 5). Interleaving them at the bit level — borrow chain and
+carry chain advance one stage per bit — reduces combined dep depth to ~6.
+
+```cpp
+// per bit b in 0..2 (and adapted for bits 3, 4 where h_old/h_new are 0):
+//   tmp_b      = v.b_b ^ h_old.h_b ^ borrow_{b-1}
+//   borrow_b   = BSL(v.b_b ^ h_old.h_b, h_old.h_b, borrow_{b-1})
+//   out_b      = tmp_b ^ h_new.h_b ^ carry_{b-1}
+//   carry_b    = BSL(tmp_b ^ h_new.h_b, carry_{b-1}, tmp_b)
+```
+
+Op count: 21 ops vs 22 for separate sub + add. Dep depth: 6 vs 10.
+
+Result: vb28 94.5 s → vb33 95.9 s. Per-counter:
+
+```text
+                   vb28      vb33
+cycles            108.4 G   110.6 G
+instructions      348.5 G   350.0 G
+IPC                3.21      3.16
+stall_backend      30.0 G    27.1 G   (-10 %)
+```
+
+Backend stalls did drop by ~10 % (confirming the dep chain shortened),
+but the OOO engine in vb28 was already overlapping the two chains by
+interleaving across the two columns in the 2-col unroll — so the chain
+was already effectively depth ~6 at the schedule level. The fused
+version's tighter inner function appears to have given the register
+allocator slightly less freedom; the small backend-stall improvement
+got cancelled out by a slight uptick in total cycles.
+
+Kept in the tree because the dep-chain analysis is useful for any future
+work that breaks the 2-col unroll (e.g. SVE2 with wider vectors).
+
+### Where vb28 sits on the optimisation curve
+
+At 94.5 s on c8g.2xlarge, vb28 hits multiple ceilings simultaneously:
+
+- **IPC 3.21 / 4.0** — 80 % of peak SIMD issue
+- **CPU util 6.61 / 8** — 83 % of peak threading
+- **L1d miss rate 4.83 %** — already low; HW prefetcher does the rest
+- **stall_backend 27.7 %** — most of which is short execution-unit
+  contention rather than memory
+
+The remaining headroom to sub-60 s would require **fewer instructions per
+cell**, not better scheduling. The two paths visible are:
+
+1. A byte-form V representation (V5 → single uint8 per cell): collapses
+   the 22-op slide ripple to 2 vector ops, but loses the 8× compression
+   from bitplane storage and makes the whole grid DRAM-bound (5+ GB per
+   bitplane variant) — would not pay back on this workload.
+2. A wider SIMD path (SVE2, currently 128-bit on Neoverse-V2, but a
+   future SVE2-256 part would double the cells per vector). Out of scope
+   on c8g.2xlarge.
+
+vb28 is therefore the chosen submission candidate from this branch.
