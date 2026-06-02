@@ -740,3 +740,68 @@ write-and-immediately-reload of one H row through L2.
 At 32K wide, one H row is N/8 × 3 = 12 KiB. Across 32768 rows × 10000 gens
 × 8 threads that's 30 TiB of L2 traffic eliminated, which matches the
 order of magnitude of the observed `stall_backend_mem` drop.
+
+## vb28: Pairwise Sync on Top of the Fused Kernel
+
+vb27's fused inner loop is ~16 % tighter than vb22, so each generation's
+compute pass is shorter — and the global `std::barrier<>` becomes a
+relatively larger share of wall time. CPU utilisation in the perf snapshot
+dropped from vb22's 6.62 / 8 to vb27's 5.98 / 8, even though the underlying
+work per gen also shrank.
+
+vb28 replaces the global barriers with the same per-thread atomic
+gen-counter scheme from vb25: each thread waits only on its two row-band
+neighbours (toroidal wrap), advances its own `done_gen` counter, and
+toggles `src` / `dst` by gen parity locally. The cur/next pointer pair is
+removed from the main thread.
+
+The perf snapshot recovers most of what vb27 lost:
+
+```text
+                   vb27      vb28
+task-clock         40789     40677
+CPUs utilised      5.98      6.61
+500-gen wall       6.82 s    6.16 s    (-9.7 %)
+10000-gen wall    95.21 s   94.54 s    (-0.7 %)
+```
+
+The 9.7 % short-run win does not propagate fully to 10000 gens because the
+absolute barrier cost is small per gen — at long runs the kernel itself
+dominates. Still, three stable 10000-gen runs at 94538 / 94570 / 94518 ms
+beat vb27 by ~0.7 s and beat vb22 by 16.7 %.
+
+`cmp` clean against the vb22 8K and 32K outputs.
+
+## vb29, vb30: Negative Results Kept For The Audit Trail
+
+Two further attempts on top of vb28 both regressed, both informative.
+
+### vb29 — software prefetch
+
+Hypothesis: with the inner loop already very tight, the L1/L2 prefetcher
+might not be fast enough to keep up with the streaming reads of the
+entering row, the V scratch, and the ring slot. Inserted
+`__builtin_prefetch` ~4 column-registers ahead for each of those streams.
+
+Result: vb28 94.5 s → vb29 97.8 s. The Neoverse-V2 HW L2 prefetcher already
+streams those accesses; SW prefetch instructions added to the dispatch
+budget without removing any L2 misses (vb28 already had only 5.9 % of
+cycles in `stall_backend_mem`). Net: noisier pipeline, slower wall clock.
+
+### vb30 — peeled boundary iteration
+
+Hypothesis: the ternary
+`adult_next_1 = (r + 2 < R_REGS) ? load_new_adult(r + 2) : load_new_adult(0)`
+in the column-pair loop forces the compiler either to branch or to keep
+the wrap-around register live across the row, possibly causing a stack
+reload. Peeled the final pair (`r = R_REGS - 2`) out into a separate
+boundary block whose `adult_next_1` is the precomputed `bnd_adult`,
+making the main loop's `adult_next_1` load unconditional.
+
+Result: vb28 94.5 s → vb30 97.1 s. The compiler was already producing tight
+code for the ternary on Neoverse-V2; the extra peeled block added icache
+pressure and probably perturbed scheduling. Net regression.
+
+Both files are kept in the tree as documented negative results. They are
+the natural follow-ups any reader would propose, so leaving the data
+visible saves them the round trip.

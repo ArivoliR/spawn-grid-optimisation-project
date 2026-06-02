@@ -30,6 +30,9 @@ byte-grid ladder remains in `versions/PERFORMANCE_PROGRESS.md`.
 | vb25 | `bitplane_versions/25_pairwise_sync.cpp` | vb22 with the global `std::barrier` replaced by per-thread atomic gen counters: each thread only waits for its two row-band neighbours (toroidal wrap). |
 | vb26 | `bitplane_versions/26_bsl_maj_fold.cpp` | vb22 with carry-chain MAJ-folding throughout `sum_of_5`, `add_v5_h3`, `sub_v5_h3`. Uses the identity `MAJ(a,b,c) = BSL(a^b, c, a)` to collapse each 3-op ripple stage to 1 BSL. Eliminates `vmvnq` in `sub_v5_h3`. |
 | vb27 | `bitplane_versions/27_single_pass.cpp` | vb26 with the H computation fused into the slide loop. The new row's H lives only in registers between produce and consume; the ring still holds the 4 surviving H rows. Ring shrinks from 6 to 5 slots (2-row unroll dropped, replaced by 2-column unroll for ILP). |
+| vb28 | `bitplane_versions/28_single_pass_pairwise.cpp` | vb27 + vb25's pairwise neighbour sync. vb27's tighter inner loop made the global barrier relatively more expensive; pairwise atomic counters recover the threading loss. |
+| vb29 | `bitplane_versions/29_prefetch.cpp` | vb28 + software prefetch hints in the column loop (entering row, V scratch, ring, source). **Negative result** — the HW L2 prefetcher already handles the streaming pattern, and SW prefetches polluted the pipeline. |
+| vb30 | `bitplane_versions/30_peeled_boundary.cpp` | vb28 with the `(r + 2 < R_REGS) ? load(r+2) : load(0)` ternary peeled out into a separate boundary block, so the main loop's `adult_next_1` load is unconditional. **Negative result** — the compiler was already handling the conditional well; the peeled version regressed. |
 
 All versions keep the same CLI and binary I/O format:
 
@@ -341,7 +344,10 @@ public_1_random_low_32768 input. Build flags noted per row.
 | vb24 K=8 2D diamond tile | 122425 ms | as above, `-DSPAWN_K=8` | Same. |
 | vb25 pairwise neighbour sync | 113177 ms | tuned flags | Marginal: ~0.18 of 8 CPUs reclaimed (6.62 → 6.79). Barriers were not the dominant cost. |
 | vb26 BSL MAJ-fold | 108974 ms | tuned flags | -8.2% instructions vs vb22 perf-counted; -4% wall. `cmp` clean vs vb22 32K output. |
-| **vb27 single-pass fused kernel** | **95214 ms** | tuned flags | -16% wall vs vb22. IPC 3.20 vs vb22's 2.93. Backend memory stalls -68% (the H scratch round-trip is gone). `cmp` clean vs vb22 32K output. 3 stable runs: 95214 / 95261 / 95223 ms. |
+| vb27 single-pass fused kernel | 95214 ms | tuned flags | -16% wall vs vb22. IPC 3.20 vs vb22's 2.93. Backend memory stalls -68% (the H scratch round-trip is gone). `cmp` clean vs vb22 32K output. 3 stable runs: 95214 / 95261 / 95223 ms. |
+| **vb28 single-pass + pairwise sync** | **94538 ms** | tuned flags | -16.7% wall vs vb22. Pairwise atomic gen counters recover threading loss from vb27 (CPU util 5.98→6.61 at 500 gens). `cmp` clean vs vb22 32K output. 3 stable runs: 94538 / 94570 / 94518 ms. |
+| vb29 software prefetch | 97809 ms | tuned flags | **Regression** vs vb28. `__builtin_prefetch` 4 column-registers ahead on entering row + V + ring + src; HW L2 prefetcher already handled the streaming pattern, SW prefetch polluted the pipeline. Kept as a documented negative result. |
+| vb30 peeled boundary | 97120 ms | tuned flags | **Regression** vs vb28. Peeled the `(r+2 < R_REGS) ? load(r+2) : load(0)` ternary out into a separate boundary block. Compiler was already handling the conditional well — the peeled version added icache pressure without helping. |
 
 Per-counter snapshot (vb27, 500 gens at 32K x 8 threads):
 
@@ -520,9 +526,19 @@ g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
 g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
   bitplane_versions/26_bsl_maj_fold.cpp -o /tmp/vb26
 
-# vb27: single-pass fused kernel (current best at 95.2 s on the target box)
+# vb27: single-pass fused kernel
 g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
   bitplane_versions/27_single_pass.cpp -o /tmp/vb27
+
+# vb28: single-pass + pairwise sync (current best at 94.5 s on the target box)
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/28_single_pass_pairwise.cpp -o /tmp/vb28
+
+# vb29 / vb30: documented negative results (regressions)
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/29_prefetch.cpp -o /tmp/vb29
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/30_peeled_boundary.cpp -o /tmp/vb30
 ```
 
 Cross-check vb27 against vb22 on the 32K boundary input:
