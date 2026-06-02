@@ -24,6 +24,12 @@ byte-grid ladder remains in `versions/PERFORMANCE_PROGRESS.md`.
 | vb15 | `bitplane_versions/15_bitplane_fused_slide.cpp` | Tests a fused carry-save vertical slide update for `V = V - H_out + H_in`; correct, but slower than `vb14` in the first target benchmark. |
 | vb16 | `bitplane_versions/16_bitplane_v_interleaved.cpp` | Cleaner follow-up to `vb14`: stores the five vertical-count scratch planes as adjacent per-register `V5` records. |
 | vb17 | `bitplane_versions/17_bitplane_h_interleaved.cpp` | Applies the same interleaving to H scratch (h0/h1/h2 adjacent per register per row), plus three micro-opts in `apply_rule_byte`: drop `nc1`, EOR3 for `next_high`, BCAX for `next_low`. |
+| vb22 | `bitplane_versions/22_ring_buffer.cpp` | Drops vb17's block-H scratch (1.5 MiB / thread) in favor of a streaming 6-slot H ring (~72 KiB) with a Karnaugh-minimised `apply_rule_byte` (17 boolean ops, no `vmvnq`). |
+| vb23 | `bitplane_versions/23_ring_k4_temporal.cpp` | vb22 + full-slab K-temporal blocking (each thread processes K generations locally with a 2K-row ghost margin before writeback). K configurable via `-DSPAWN_K`. |
+| vb24 | `bitplane_versions/24_diamond_tile.cpp` | vb22 + 2D diamond tiling: column strips (`TILE_W_REGS=8`, ~2.6 MiB per thread at 32K) with trapezoidal writeback, designed to fit L3 across 8 threads. |
+| vb25 | `bitplane_versions/25_pairwise_sync.cpp` | vb22 with the global `std::barrier` replaced by per-thread atomic gen counters: each thread only waits for its two row-band neighbours (toroidal wrap). |
+| vb26 | `bitplane_versions/26_bsl_maj_fold.cpp` | vb22 with carry-chain MAJ-folding throughout `sum_of_5`, `add_v5_h3`, `sub_v5_h3`. Uses the identity `MAJ(a,b,c) = BSL(a^b, c, a)` to collapse each 3-op ripple stage to 1 BSL. Eliminates `vmvnq` in `sub_v5_h3`. |
+| vb27 | `bitplane_versions/27_single_pass.cpp` | vb26 with the H computation fused into the slide loop. The new row's H lives only in registers between produce and consume; the ring still holds the 4 surviving H rows. Ring shrinks from 6 to 5 slots (2-row unroll dropped, replaced by 2-column unroll for ILP). |
 
 All versions keep the same CLI and binary I/O format:
 
@@ -320,6 +326,37 @@ workload, `vb16` measured `120843.475 ms` with
 `-Ofast -DSPAWN_BLOCK_ROWS=96`, which is about `6.4 s` faster than the best
 `vb14` run while staying simple to explain.
 
+### 32768x32768, 10000 Generations, c8g.2xlarge (Graviton4, 8 vCPUs)
+
+Measured on the target instance with `taskset -c 0-7`, 15 GiB RAM,
+public_1_random_low_32768 input. Build flags noted per row.
+
+| Version | Time | Flags | Notes |
+|---|---:|---|---|
+| vb22 ring buffer baseline | 113507 ms | `-Ofast -mcpu=neoverse-v2+sha3 -pthread` | First 8-thread target measurement of the streaming kernel. |
+| vb22 + funroll-all-loops + flto | 111142 ms | `-O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto` | Free compiler tuning, kept for all subsequent versions. |
+| vb23 K=4 full-slab temporal | 125840 ms | as above, `-DSPAWN_K=4` | Regression: temporal blocking trades DRAM traffic for ghost-row work; here the compute side dominates and the trade is net negative. |
+| vb23 K=8 full-slab temporal | 119373 ms | as above, `-DSPAWN_K=8` | Same regression, less severe. |
+| vb24 K=4 2D diamond tile | 134704 ms | as above, `-DSPAWN_K=4` | Strip overhead (trapezoidal writeback + ghost-column copies) added more cost than DRAM savings. |
+| vb24 K=8 2D diamond tile | 122425 ms | as above, `-DSPAWN_K=8` | Same. |
+| vb25 pairwise neighbour sync | 113177 ms | tuned flags | Marginal: ~0.18 of 8 CPUs reclaimed (6.62 → 6.79). Barriers were not the dominant cost. |
+| vb26 BSL MAJ-fold | 108974 ms | tuned flags | -8.2% instructions vs vb22 perf-counted; -4% wall. `cmp` clean vs vb22 32K output. |
+| **vb27 single-pass fused kernel** | **95214 ms** | tuned flags | -16% wall vs vb22. IPC 3.20 vs vb22's 2.93. Backend memory stalls -68% (the H scratch round-trip is gone). `cmp` clean vs vb22 32K output. 3 stable runs: 95214 / 95261 / 95223 ms. |
+
+Per-counter snapshot (vb27, 500 gens at 32K x 8 threads):
+
+```text
+task-clock       40788 ms   (5.98 CPUs utilized)
+cycles           108.4 G    @ 2.66 GHz
+instructions     346.4 G    (IPC 3.20)
+stall_backend     30.0 G    (27.7% of cycles)
+stall_backend_mem  6.4 G    ( 5.9% of cycles)
+```
+
+For comparison, vb22 at the same 500-gen workload: IPC 2.93, stall_backend
+33.7%, stall_backend_mem 15.5%. vb27 reclaims ~9.6 G cycles of backend memory
+stalls — the entire H scratch round-trip.
+
 ## Correctness Notes
 
 Current `vb04`/`vb05` checks against the reference:
@@ -459,6 +496,41 @@ taskset -c 0-7 /tmp/vb08 test_grids/public_1_random_low_8192.bin /tmp/vb08_8192.
 cmp /tmp/vb03_8192.bin /tmp/vb06_8192.bin
 cmp /tmp/vb03_8192.bin /tmp/vb07_8192.bin
 cmp /tmp/vb03_8192.bin /tmp/vb08_8192.bin
+```
+
+Build the vb22/23/24 streaming family on AWS:
+
+```bash
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/22_ring_buffer.cpp -o /tmp/vb22
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  -DSPAWN_K=8 bitplane_versions/23_ring_k4_temporal.cpp -o /tmp/vb23_K8
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  -DSPAWN_K=8 bitplane_versions/24_diamond_tile.cpp -o /tmp/vb24_K8
+```
+
+Build the vb25 / vb26 / vb27 ladder on AWS (current best candidates):
+
+```bash
+# vb25: pairwise neighbour sync (atomic gen counters)
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/25_pairwise_sync.cpp -o /tmp/vb25
+
+# vb26: BSL MAJ-fold across carry chains (best of the two-pass family)
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/26_bsl_maj_fold.cpp -o /tmp/vb26
+
+# vb27: single-pass fused kernel (current best at 95.2 s on the target box)
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/27_single_pass.cpp -o /tmp/vb27
+```
+
+Cross-check vb27 against vb22 on the 32K boundary input:
+
+```bash
+taskset -c 0-7 /tmp/vb22 test_grids/public_1_random_low_32768.bin /tmp/o22.bin
+taskset -c 0-7 /tmp/vb27 test_grids/public_1_random_low_32768.bin /tmp/o27.bin
+cmp /tmp/o22.bin /tmp/o27.bin && echo MATCH
 ```
 
 For final reporting, rerun the bitplane ladder on the target Graviton4 machine

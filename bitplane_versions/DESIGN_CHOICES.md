@@ -533,3 +533,210 @@ tree-vs-ripple adder structure. Neoverse-V2 is also an out-of-order core with
 wide NEON throughput and register renaming, so the x86 null result may transfer
 better than expected. Tree reduction remains correct and useful to keep around,
 but it should not block the NEON port.
+
+## vb22: Streaming H Ring (Drop Block-H Scratch)
+
+vb17 keeps a "block-H" scratch buffer that materialises `BLOCK_ROWS+4` H rows
+ahead of the slide pass. At 32768 wide that buffer is ~1.5 MiB per thread,
+mostly hot in L2 but blowing past L1. The redesign:
+
+- 6-slot streaming H ring of (h0, h1, h2) plane triples. At 32768 the ring is
+  6 × 3 × 4096 B = **~72 KiB per thread**, sized to live in L2 with the V
+  scratch in L1 footprint and almost no L2 pressure from H reads.
+- One `compute_H_row` per output row, instead of a batched fill of
+  `BLOCK_ROWS` H rows then a batched slide. The amortisation across multiple
+  output rows is preserved by the ring slots — each computed H is read 5 times
+  before being overwritten.
+- 2-way r-unroll of both the V-init and the slide loop. This is what forces
+  ring size 6: a 2-row unrolled iteration reads H rows {y-3..y+3} for the
+  pair (y, y+1), which is 6 H rows including the new one being computed.
+- `apply_rule_byte` Karnaugh-minimised to 17 boolean ops with no `vmvnq`,
+  using BSL for the born mux and BCAX for `next_low`.
+
+On target the streaming ring is a clean baseline. It is slower than vb17 in
+absolute terms on the boundary input only because vb17's block-H gets warm
+data for free at workloads where the block fits L2 anyway. But it is the
+right shape for everything that follows.
+
+## vb23, vb24: Temporal Blocking Experiments (Negative Result)
+
+Two experiments testing the hypothesis that DRAM bandwidth is the binding
+constraint at 32K x 8 threads:
+
+**vb23** — full-slab K-temporal blocking. Each thread reads its row band
+plus a 2K-row ghost margin on each side, runs K generations locally, then
+writes back. K configurable via `-DSPAWN_K=N`.
+
+**vb24** — 2D diamond tiling. Column strips of 128 bytes (TILE_W_REGS=8) with
+trapezoidal writeback: each strip writes only the central
+`128 - 2 × ceil(2K/8)` bytes per gen, and adjacent strips overlap by enough
+margin that boundary cells reach the writeback region only after their
+inputs were also locally computed.
+
+Both verified correct against vb22 across the 5 public patterns at 2048,
+8192, and 32K x 100-gen single-threaded.
+
+Measured at 32K x 10000 x 8 threads:
+
+```text
+vb22 baseline      113.5 s
+vb23 K=4           125.8 s  (+11%)
+vb23 K=8           119.4 s  (+5%)
+vb24 K=2           167.3 s  (+47%)
+vb24 K=4           134.7 s  (+19%)
+vb24 K=8           122.4 s  (+8%)
+```
+
+**Conclusion**: vb22's streaming ring is not DRAM-bound. Per-counter
+profiling on vb22 shows `stall_backend_mem = 15.5%` of cycles — substantial
+but not dominant; the L1/L2 prefetcher keeps the streaming pattern fed.
+Temporal blocking buys nothing here because the *new* memory traffic
+(ghost-row reads/writes for K-temporal; ghost-column copies and trapezoidal
+writeback for 2D tiling) exceeds the small DRAM saving from reduced
+generation traffic. Both files retained for the design audit and as a
+ready-made baseline if the workload ever changes shape.
+
+## vb25: Pairwise Neighbour Sync (Marginal)
+
+vb22 uses two `std::barrier<>`s per generation (start + end), which forces
+all eight threads to converge twice per gen × 10000 gens = 80000 global
+syncs. vb25 replaces them with **per-thread atomic gen counters**: thread
+`t` waits only for `t-1` and `t+1` (toroidal wrap) to have completed the
+previous gen before starting the next. Each counter sits on its own 64-byte
+cache line.
+
+Justification: `step_rows_bitplane` for rows `[y0, y1)` reads source rows
+`[y0-2, y1+1]`. The only neighbouring data is owned by the two adjacent
+threads.
+
+Measured result: vb22 at 113.5 s → vb25 at 113.2 s. Per-counter snapshot
+shows CPU utilization climbing from 6.62 / 8 to 6.79 / 8. The barrier was
+real but small; the remaining 1.2 of 8 lost CPUs is workload imbalance and
+SIMD pipe saturation, not synchronization. Kept in the tree as a baseline
+for the threading shape we want for vb27.
+
+## vb26: BSL MAJ-Fold Across Carry Chains
+
+The five-bit column accumulator `V5` slides one row at a time via
+`sub_v5_h3(V5, Sum3)` and `add_v5_h3(V5, Sum3)`. Both functions are ripple
+chains of depth 5, with interior stages that compute carry/borrow as a
+majority of three inputs:
+
+- Adder: `carry_out = MAJ(a, b, carry_in)`
+- Subtractor: `borrow_out = MAJ(~a, b, borrow_in)`
+
+vb22 expresses MAJ via `maj_u8(a, b, c) = BSL(a^b, c, a & b)` — three ops
+(eor + and + bsl). For the subtractor that becomes 4 ops because of the
+extra `vmvnq` to invert `a`. The same MAJ pattern appears in `sum_of_5`
+(the 5-input horizontal sum used inside `horizontal_window_sum`).
+
+The identity used in vb26 is:
+
+```
+MAJ(a, b, c) = BSL(a ^ b, c, a)
+```
+
+Proof: when `a == b`, `a^b = 0` and BSL selects the "else" lane = `a` (which
+equals `b`), so MAJ = `a` = `b`. When `a != b`, `a^b = 1` and BSL selects
+the "then" lane = `c`, so MAJ = `c`. Both branches agree with the truth
+table for the 2-of-3 majority. The same identity drives the full-subtractor:
+`borrow_out = BSL(b1 ^ h, h, borrow_in)`, no `vmvnq` needed.
+
+Each interior carry/borrow stage drops from 3-4 ops to 1 BSL (given the
+already-computed `a^b` from the corresponding sum bit). Sum bits use
+`veor3q_u8` (SHA3) where three inputs are XORed.
+
+Per-counter result on the target at 32K x 500 gens:
+
+```text
+                   vb22       vb26      delta
+instructions       376.9 G    346.1 G   -8.2 %
+cycles             128.5 G    124.3 G   -3.3 %
+IPC                2.93       2.78      -5 %
+stall_backend      43.3 G     41.0 G    -5 %
+```
+
+Wall clock at 32K x 10000 x 8 threads: vb22 baseline 113.5 s → vb26 109.0
+s. The IPC dropped slightly because the new BSL form has a tighter serial
+dependency than the old `vxor3 + maj_u8` (which could issue the and/bsl in
+parallel), but the absolute instruction-count win is larger than the IPC
+loss. `cmp` clean against vb22 at 8K and 32K outputs.
+
+vb26 is the best two-pass kernel (compute_H_row pass + slide pass) and was
+the basis for vb27.
+
+## vb27: Single-Pass Fused Kernel (Current Best)
+
+`perf record` on vb26 showed 31.5 % of cycles in `compute_H_row` and 63.5 %
+in `step_rows_bitplane`. The two-pass structure stores each computed H row
+to the ring and reads it back in the slide pass — an L1/L2 round trip per
+H value, even though the producer and consumer are microseconds apart on
+the same thread.
+
+vb27 fuses the two passes. Inside the inner column-pair loop:
+
+1. Load the entering row's adult bits with a 3-wide sliding window
+   (`adult_prev`, `adult_curr`, `adult_next_0`, `adult_next_1`).
+2. Compute new H values for the column pair via `horizontal_window_sum`.
+3. Use the new H values **immediately** in `add_v5_h3` (no scratch round
+   trip for the new H).
+4. Subtract the old H from the ring slot the new H will overwrite.
+5. Store the new H into that ring slot for future iterations.
+6. Apply the rule for the current output row.
+7. Slide the adult window for the next column pair.
+
+The fusion also drops vb22's 2-row unroll (the structural reason vb22
+needed a 6-slot ring) in favour of 2-column unroll for ILP, which works
+out better when the inner-loop register pressure includes both the sliding
+adult window and two V5 accumulators. The ring shrinks from 6 to 5 slots
+(`RING_SLOTS = 5`), with `tail` advancing by 1 per row.
+
+Per-counter result on the target at 32K x 500 gens:
+
+```text
+                       vb22       vb26       vb27       delta vs vb22
+cycles                128.5 G    124.3 G    108.4 G    -16 %
+instructions          376.9 G    346.1 G    346.4 G    -8 %
+IPC                    2.93       2.78       3.20      +9 %
+stall_backend          43.3 G     41.0 G     30.0 G    -31 %
+stall_backend_mem      19.9 G     19.9 G      6.4 G    -68 %
+```
+
+The 68 % drop in `stall_backend_mem` is the H scratch round trip we
+eliminated. IPC climbs back up to 3.20 from vb26's 2.78 because the BSL
+dependency chain is now overlapped with the fused H compute and the ring
+store, giving the OOO engine independent work to issue.
+
+Wall clock at 32K x 10000 x 8 threads, three stable runs:
+
+```text
+vb27 run 1    95214 ms
+vb27 run 2    95261 ms
+vb27 run 3    95223 ms
+```
+
+That's **-16.1 % vs vb22's 113.5 s baseline** and **-12.6 % vs vb26's
+108.97 s**. `cmp` clean against vb22 at 8K and 32K outputs. Three stable
+runs ± 50 ms.
+
+### Why the fusion works
+
+Per-row, vb22/vb26 spend cycles like this:
+
+```text
+compute_H_row(new row)        — write 3 bitplane rows × N/8 bytes to ring slot
+slide loop:
+  load 5 H values from ring   — read 3 bitplane rows × N/8 bytes
+  sub_v5_h3
+  add_v5_h3
+  apply_rule_byte
+```
+
+vb27 keeps the new H entirely in registers between produce and consume.
+The old H is still loaded from the ring slot we're about to overwrite, but
+that single load is what we had before anyway. Net: each row saves the
+write-and-immediately-reload of one H row through L2.
+
+At 32K wide, one H row is N/8 × 3 = 12 KiB. Across 32768 rows × 10000 gens
+× 8 threads that's 30 TiB of L2 traffic eliminated, which matches the
+order of magnitude of the observed `stall_backend_mem` drop.
