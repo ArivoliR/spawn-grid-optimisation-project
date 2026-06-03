@@ -36,6 +36,10 @@ byte-grid ladder remains in `versions/PERFORMANCE_PROGRESS.md`.
 | vb31 | `bitplane_versions/31_column_strip.cpp` | Column-strip-major iteration: per thread, walk column strips of S=2 col regs, keeping V state in registers across all rows in the strip. Aimed to eliminate the V scratch round-trip (~12% of instructions). **Negative result** — column-major access on row-major src/dst data caused the L1 miss rate to jump from 4.83% to 15.87%. Cache penalty dwarfed the saved V loads. |
 | vb32 | `bitplane_versions/32_unroll4.cpp` | vb28 with 4-column unroll instead of 2 (40+ live V vectors per iter). **Negative result** — register spill regressed the wall by ~17%. |
 | vb33 | `bitplane_versions/33_fused_slide.cpp` | Combined `sub_v5_h3` + `add_v5_h3` into a single `slide_v5_h3` that interleaves the borrow and carry chains at the bit level, reducing combined dep depth from 10 to 6. **Marginal/neutral** — backend stalls dropped 10% (confirming the dep-chain reduction), but the OOO engine was already overlapping the chains via 2-col unroll, so wall time didn't improve. |
+| vb34 | `bitplane_versions/34_pinned.cpp` | vb28 + explicit `pthread_setaffinity_np` per worker thread. **Neutral** — profile showed many cmp/yield instructions in the hot path, but pinning didn't reduce them. Thread migration was not the cause. |
+| vb35 | `bitplane_versions/35_no_yield.cpp` | vb28 with the `yield` instructions removed from the spin-wait, pure busy-spin. **Neutral** — the `yield` cost was already negligible. |
+| vb36 | `bitplane_versions/36_combined.cpp` | Stack vb33 + vb34 (fused slide + CPU pinning). Hypothesis: neutral parts might compound. **Regression** — the larger inlined slide body increased register pressure when combined with 2-col unroll, eating any threading gain. |
+| vb37 | `bitplane_versions/37_byte_v.cpp` | Conversion-cost measurement: vb28 with `sum3_to_byte8` conversion added as dead code in the inner loop (result held alive via inline asm). Quantifies what a full byte-form V would cost. **Catastrophic regression** (167 s vs 94.5 s) — adding only the conversion adds 72 s of wall time, proving the bit→byte expansion on NEON dwarfs any 22→2-op slide savings. |
 
 All versions keep the same CLI and binary I/O format:
 
@@ -354,6 +358,10 @@ public_1_random_low_32768 input. Build flags noted per row.
 | vb31 column-strip | 160164 ms | tuned flags | **Large regression** vs vb28. Column-major iteration of row-major data: L1 miss rate jumped 4.83% → 15.87%, IPC dropped 3.21 → 2.28. The V scratch traffic we saved was much smaller than the cache penalty. |
 | vb32 4-col unroll | 110757 ms | tuned flags | **Regression** vs vb28. Register pressure (40+ live vectors per iter) caused spills. |
 | vb33 fused slide_v5 | 95912 ms | tuned flags | Neutral/marginal vs vb28. `sub_v5_h3` + `add_v5_h3` combined into single bit-interleaved ripple (dep depth 10 → 6). Backend stalls dropped 27.7% → 24.5% (confirming the dep chain reduction), but the 2-col unroll was already exposing enough ILP for the OOO engine; wall time held at ~95.9 s. |
+| vb34 CPU pinning | 94867 ms | tuned flags | Neutral. Pinning each worker to a specific CPU via `pthread_setaffinity_np` did not change wall time, indicating thread migration was not amplifying the spin-wait. |
+| vb35 pure spin (no yield) | 94792 ms | tuned flags | Neutral. Removing the `yield` from the spin-wait did not change wall time — the perf-annotated yield% was either mis-attributed or already cheap. |
+| vb36 fused slide + pinning | 96570 ms | tuned flags | **Regression** vs vb28. Stacking the neutral optimisations compounded their downsides (register pressure from larger inlined slide, lower OOO freedom). |
+| vb37 byte-V conversion cost | 166999 ms | tuned flags | **Decisive regression** (+72 s). Empirical proof that byte-form V is unviable on NEON: the dead-code conversion (bitplane Sum3 → 8 byte-vectors per col reg, no slide replacement) alone added 72 s — 3.6× larger than the maximum possible saving from a full byte-V slide (which would save ~20 s at best). Conversions via `vqtbl1q + vand + vceqq + vmvnq + vshrq` are intrinsically expensive for this access pattern. |
 
 Per-counter snapshot (vb27, 500 gens at 32K x 8 threads):
 
@@ -551,6 +559,14 @@ g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
   bitplane_versions/32_unroll4.cpp -o /tmp/vb32
 g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
   bitplane_versions/33_fused_slide.cpp -o /tmp/vb33
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/34_pinned.cpp -o /tmp/vb34
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/35_no_yield.cpp -o /tmp/vb35
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/36_combined.cpp -o /tmp/vb36
+g++-14 -std=c++23 -O3 -mcpu=neoverse-v2+sha3 -pthread -funroll-all-loops -flto \
+  bitplane_versions/37_byte_v.cpp -o /tmp/vb37
 ```
 
 Cross-check vb27 against vb22 on the 32K boundary input:

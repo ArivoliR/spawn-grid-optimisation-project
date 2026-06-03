@@ -911,3 +911,138 @@ cell**, not better scheduling. The two paths visible are:
    on c8g.2xlarge.
 
 vb28 is therefore the chosen submission candidate from this branch.
+
+## vb34, vb35, vb36: Sub-80s Push (All Neutral or Regress)
+
+The `perf annotate` of vb28 showed unexpectedly hot `cmp` and `yield`
+instructions clustered around the spin-wait — looked like up to 30% of
+hot-path cycles. Three follow-ups targeting that signal, then one
+attempt to stack the neutral optimisations:
+
+### vb34 — explicit CPU pinning
+
+Hypothesis: threads migrating between cores cause cache loss and
+amplify the time each thread spends spin-waiting on its neighbours. Add
+`pthread_setaffinity_np(self, CPU(t))` at the start of each worker.
+
+Result: vb28 94.5 s → vb34 94.9 s. Neutral. Whatever was attributed to
+the spin-wait in `perf annotate` was either mis-attributed (cmp/yield
+opcodes inside step_rows_bitplane's loop bounds being conflated with
+the worker_loop) or already cheap.
+
+### vb35 — pure busy-spin (no yield)
+
+Hypothesis: the `yield` ARM hint instruction itself was adding latency
+to the spin-wait. Replace it with empty body, just `cmp` + branch.
+
+Result: vb28 94.5 s → vb35 94.8 s. Confirms yield wasn't a cost.
+
+### vb36 — vb33 fused slide + vb34 pinning
+
+Hypothesis: each of vb33 (fused slide_v5_h3 with depth-6 ripple) and
+vb34 (pinning) was neutral alone; combining them might push the OOO
+engine across some threshold (less dep-chain pressure + less migration
+noise).
+
+Result: vb28 94.5 s → vb36 96.6 s. **Regression.** The combination
+compounded register pressure: the bigger inlined `slide_v5_h3` body in
+the 2-col unrolled inner loop ate the marginal threading gain. Stacking
+neutral micro-optimisations isn't free — each one trades one resource
+for another, and the totals don't add.
+
+### Final position on the sub-80 s question
+
+Theoretical floor for this algorithm on this hardware:
+
+```text
+6920 G instructions / (8 CPUs × 4 IPC × 2.66 GHz) = 81.4 s   (peak)
+```
+
+We are at 94.5 s = 16 % off peak. To break sub-80, we need *both*:
+
+- IPC >3.6 (currently 3.21) — needs further reducing the backend
+  dep-chain stalls
+- Effective CPUs >7.5 (currently ~6.6 averaged) — needs reducing the
+  inter-thread sync drift
+
+Independent attempts at each (vb33 backend, vb34/35 sync) moved
+either metric by ≤5 % without translating to wall-clock improvement,
+because the gain was always re-absorbed by a different resource —
+register pressure in vb33, schedule noise in vb34/35.
+
+Sub-80 is **not** reachable from vb28's design space without one of:
+
+- An algorithmic change that reduces total instructions (Hashlife-style
+  memoisation, or a representation that drops the depth-5 ripple
+  ladder). Hashlife only pays back on repeating patterns; the
+  `random_low` workload destroys most of its memoisation benefit. Byte-
+  form V cuts the slide to 2 SIMD ops but makes the whole grid DRAM-
+  bound (5+ GB working set vs 1 GB for bitplane), so we lose more on
+  memory than we save on ALU.
+- Wider hardware SIMD. Neoverse-V2 SVE2 is 128-bit, same as NEON, so
+  the same kernel reissued in SVE2 would give the same throughput.
+  Wider SIMD (256, 512) would proportionally drop wall time but is a
+  c8g.2xlarge constraint.
+
+vb28 at 94.5 s remains the best achievable from this branch on this
+hardware; the negative results above bound the optimisation neighbourhood.
+
+## vb37: Empirical Refutation of Byte-Form V
+
+The most attractive remaining idea was a byte-form V representation: store
+each cell's count as a full `uint8_t` (value 0..25) instead of five
+bitplane planes. The slide then becomes two SIMD byte operations
+(`vsubq_u8` + `vaddq_u8`) per 16 cells, replacing the 22-op bitplane
+ripple — a potential saving of ~20 s of wall time at 32K × 10000 gens.
+
+The catch was always the conversion: `h_old` / `h_new` arrive from
+`horizontal_window_sum` as 3 bitplanes (1 bit per cell across 128 cells
+per vector), and V's output must end up as bitplane masks for the
+`apply_rule_byte` predicates. Each round-trip needs a bit→byte spread
+(`vqtbl1q` broadcast + power-of-2 mask + normalise to 0/1) plus a
+byte→bit pack (mask + position-multiply + horizontal reduce).
+
+vb37 measures this conversion cost directly. It is vb28 unchanged in
+all logic — same bitplane slide, same `apply_rule_byte` — but with
+`sum3_to_byte8` invoked on `h_new_0`, `h_new_1`, `h_old_0`, `h_old_1`
+inside the column-pair inner loop. The results are held alive via an
+`__asm__ __volatile__` clobber so the compiler cannot dead-eliminate
+them, but they are not consumed by anything else.
+
+```text
+vb28 baseline                                94.5 s
+vb37 (vb28 + dead-code byte conversion)     167.0 s
+Conversion overhead alone                   +72.5 s
+```
+
+Per-iteration cost analysis (per 128-cell column register):
+
+```text
+sum3_to_byte8 = 3 × bitplane_to_byte8 + combine
+              = 3 × (8 × (vqtbl1q + vand + vceqq + vmvnq + vshrq))
+                + 8 × (vshl + vshl + vorr + vorr)
+              = 3 × 40 + 32
+              = 152 ops per Sum3 conversion
+```
+
+Two `Sum3` conversions per column register pair (h_new and h_old) ×
+256 column register pairs per row × 4096 rows per thread × 10000 gens
+= ~6.3 G additional vector ops per thread. The measured +72 s wall time
+matches this — and we *haven't* counted the V_byte → V5 bitplane
+conversion needed to feed `apply_rule_byte`, which has the same shape
+in reverse and would add a similar penalty again.
+
+The theoretical maximum saving from a full byte-V slide is bounded
+above by the cost of the 22-op bitplane slide it replaces. That saving
+is **smaller than the conversion overhead by ~3.6×**. There is no
+arrangement of byte-V in this kernel that comes out positive.
+
+The conclusion holds independently of how the byte-V kernel is
+structured: the bit↔byte conversion needs ~5 ops per 16 output cells
+per bitplane plane, and the slide it would replace needs ~3 ops per 128
+cells per plane (depth-5 ripple bit-stage). Until NEON gains a
+single-instruction bit-to-byte spread, byte-form representations cannot
+beat bitplane on this kernel shape.
+
+This rules out byte-V definitively, even as a Plan B if other
+optimisations fail.
